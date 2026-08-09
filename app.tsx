@@ -1,12 +1,22 @@
 // bb-plugin-prompt-enhancer — frontend entry.
 //
-// Adds a unified "Enhance prompt" control to every composer: the zap half
+// Adds a unified "Enhance prompt" control to every composer: the spark half
 // rewrites the draft via the backend (a hidden bb thread), the chevron half
 // opens a searchable model picker (popover + command palette) to pin an
 // explicit provider+model for the enhancement (default: inherit the current
 // thread's provider, or the project default on the new-thread composer).
-// Styling uses host token classes only.
-import { useEffect, useRef, useState } from "react";
+// While an enhancement runs, the control shimmers and the draft gets an
+// animated text effect.
+//
+// The catalog + selection live in a module store: one fetch per window,
+// shared by every composer instance (a per-instance fetch would turn every
+// composer mount into a round trip).
+import {
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import {
   definePluginApp,
   useComposer,
@@ -42,13 +52,117 @@ interface ModelOverride {
   providerId: string;
   model: string;
 }
-type ModelCatalog = {
+interface ModelCatalog {
   providers: {
     id: string;
     displayName: string;
     models: { model: string; displayName: string; isDefault: boolean }[];
   }[];
+}
+type Rpc = ReturnType<typeof useRpc<typeof rpcContract>>;
+
+// ---------------------------------------------------------------------------
+// Shared catalog/selection store (per window)
+// ---------------------------------------------------------------------------
+
+interface PickerState {
+  loaded: boolean;
+  catalog: ModelCatalog | null;
+  override: ModelOverride | null;
+}
+
+let pickerState: PickerState = {
+  loaded: false,
+  catalog: null,
+  override: null,
 };
+let pickerInflight: Promise<void> | null = null;
+const pickerListeners = new Set<() => void>();
+
+function pickerSubscribe(listener: () => void): () => void {
+  pickerListeners.add(listener);
+  return () => pickerListeners.delete(listener);
+}
+
+function pickerNotify(): void {
+  for (const listener of pickerListeners) listener();
+}
+
+/** Single shared fetch; safe to call from every composer instance. */
+function ensurePickerLoaded(rpc: Rpc): void {
+  if (pickerState.loaded || pickerInflight !== null) return;
+  pickerInflight = (async () => {
+    try {
+      const [modelsResult, overrideResult] = await Promise.all([
+        rpc.call("listModels"),
+        rpc.call("getModelOverride"),
+      ]);
+      pickerState = {
+        loaded: true,
+        catalog: modelsResult,
+        override: overrideResult.override,
+      };
+    } catch {
+      // Leave unloaded — the next picker open retries.
+    } finally {
+      pickerInflight = null;
+      pickerNotify();
+    }
+  })();
+}
+
+function setSharedOverride(next: ModelOverride | null): void {
+  pickerState = { ...pickerState, override: next };
+  pickerNotify();
+}
+
+function usePickerState(): PickerState {
+  return useSyncExternalStore(
+    pickerSubscribe,
+    () => pickerState,
+    () => pickerState,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Shimmer styles — raw CSS because keyframes cannot come from the Tailwind
+// pass. Injected by a content script (the sanctioned escape hatch), removed
+// on dispose. Colors derive from currentColor only — never hardcoded.
+// ---------------------------------------------------------------------------
+
+const SHIMMER_CSS = `
+@keyframes prompt-enhancer-sweep {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+.prompt-enhancer-pill-busy {
+  background-image: linear-gradient(
+    110deg,
+    transparent 25%,
+    color-mix(in oklab, currentColor 16%, transparent) 50%,
+    transparent 75%
+  );
+  background-size: 250% 100%;
+  animation: prompt-enhancer-sweep 1.4s linear infinite;
+}
+.prompt-enhancer-draft {
+  background-image: linear-gradient(
+    110deg,
+    color-mix(in oklab, var(--foreground) 55%, transparent) 30%,
+    var(--foreground) 50%,
+    color-mix(in oklab, var(--foreground) 55%, transparent) 70%
+  );
+  background-size: 220% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  animation: prompt-enhancer-sweep 1.4s linear infinite;
+}
+`;
+
+// ---------------------------------------------------------------------------
+// Composer control
+// ---------------------------------------------------------------------------
 
 /** One half of the split control — chrome comes from the group wrapper. */
 function groupHalfClass(extra?: string): string {
@@ -69,22 +183,26 @@ function EnhanceButton() {
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
-  const [override, setOverride] = useState<ModelOverride | null>(null);
-  const [menuLoaded, setMenuLoaded] = useState(false);
+  const picker = usePickerState();
+
+  // Eagerly warm the shared store so the tooltip and check marks reflect the
+  // remembered selection without opening the picker first.
+  useEffect(() => {
+    ensurePickerLoaded(rpc);
+  }, [rpc]);
 
   const disabled = busy || view.draft.isEmpty || view.run.isRunning;
 
   const overrideLabel = (() => {
-    if (override === null || catalog === null) return null;
-    const provider = catalog.providers.find(
-      (entry) => entry.id === override.providerId,
+    if (picker.override === null) return null;
+    const provider = picker.catalog?.providers.find(
+      (entry) => entry.id === picker.override?.providerId,
     );
     const model = provider?.models.find(
-      (entry) => entry.model === override.model,
+      (entry) => entry.model === picker.override?.model,
     );
     return model === undefined || provider === undefined
-      ? override.model
+      ? picker.override.model
       : `${provider.displayName} · ${model.displayName}`;
   })();
 
@@ -96,10 +214,11 @@ function EnhanceButton() {
     pendingIdRef.current = null;
     setBusy(false);
     composer.setInputLock(false);
+    composer.setTextEffect(null);
   }
 
-  // The input lock is plugin-scoped and auto-releases on unmount/scope change;
-  // only the timeout needs explicit cleanup.
+  // Input lock and text effect are plugin-scoped and auto-release on
+  // unmount/scope change; only the timeout needs explicit cleanup.
   useEffect(() => {
     return () => {
       if (timeoutRef.current !== null) clearTimeout(timeoutRef.current);
@@ -161,6 +280,7 @@ function EnhanceButton() {
     pendingIdRef.current = id;
     setBusy(true);
     composer.setInputLock(true);
+    composer.setTextEffect({ className: "prompt-enhancer-draft" });
     timeoutRef.current = setTimeout(() => {
       if (pendingIdRef.current === id) {
         clearPending();
@@ -169,25 +289,11 @@ function EnhanceButton() {
     }, TIMEOUT_MS);
   }
 
-  async function loadMenu(): Promise<void> {
-    try {
-      const [modelsResult, overrideResult] = await Promise.all([
-        rpc.call("listModels"),
-        rpc.call("getModelOverride"),
-      ]);
-      setCatalog(modelsResult);
-      setOverride(overrideResult.override);
-      setMenuLoaded(true);
-    } catch {
-      toast.error("Failed to load the model list");
-    }
-  }
-
   async function selectOverride(next: ModelOverride | null): Promise<void> {
     setPickerOpen(false);
     try {
       await rpc.call("setModelOverride", { override: next });
-      setOverride(next);
+      setSharedOverride(next);
       toast.success(
         next === null
           ? "Enhancer uses the thread's provider default"
@@ -204,7 +310,10 @@ function EnhanceButton() {
     <div
       role="group"
       aria-label="Prompt enhancer"
-      className="flex items-center overflow-hidden rounded-md border border-input"
+      className={cn(
+        "flex items-center overflow-hidden rounded-md border border-input",
+        busy && "prompt-enhancer-pill-busy",
+      )}
     >
       <button
         type="button"
@@ -219,7 +328,7 @@ function EnhanceButton() {
         }
       >
         <Icon
-          name={busy ? "Loading" : "Zap"}
+          name={busy ? "Loading" : "AiContentGenerator01"}
           className={cn("size-4", busy && "animate-spin")}
           aria-hidden
         />
@@ -229,7 +338,7 @@ function EnhanceButton() {
         open={pickerOpen}
         onOpenChange={(open) => {
           setPickerOpen(open);
-          if (open && !menuLoaded) void loadMenu();
+          if (open) ensurePickerLoaded(rpc);
         }}
       >
         <PopoverTrigger asChild>
@@ -247,9 +356,9 @@ function EnhanceButton() {
             <CommandInput placeholder="Search models…" />
             <CommandList className="max-h-72">
               <CommandEmpty>
-                {catalog === null
-                  ? "Loading models…"
-                  : "No models match your search."}
+                {picker.loaded
+                  ? "No models match your search."
+                  : "Loading models…"}
               </CommandEmpty>
               <CommandGroup heading="General">
                 <CommandItem
@@ -259,7 +368,7 @@ function EnhanceButton() {
                 >
                   <Icon
                     name="Check"
-                    className={override === null ? undefined : "invisible"}
+                    className={picker.override === null ? undefined : "invisible"}
                     aria-hidden
                   />
                   <span className="truncate">Provider default</span>
@@ -268,13 +377,13 @@ function EnhanceButton() {
                   </span>
                 </CommandItem>
               </CommandGroup>
-              {catalog?.providers.map((provider) => (
+              {picker.catalog?.providers.map((provider) => (
                 <CommandGroup key={provider.id} heading={provider.displayName}>
                   {provider.models.map((model) => {
                     const selected =
-                      override !== null &&
-                      override.providerId === provider.id &&
-                      override.model === model.model;
+                      picker.override !== null &&
+                      picker.override.providerId === provider.id &&
+                      picker.override.model === model.model;
                     return (
                       <CommandItem
                         key={`${provider.id}:${model.model}`}
@@ -319,5 +428,17 @@ export default definePluginApp((app) => {
   app.composer.customize({
     id: "prompt-enhancer",
     actions: [{ id: "enhance", component: EnhanceButton }],
+  });
+  // Keyframes for the busy shimmer. The Tailwind pass cannot emit raw
+  // keyframes, so a content script injects them and cleans up on dispose.
+  app.contentScripts.register({
+    id: "shimmer-styles",
+    mount() {
+      const style = document.createElement("style");
+      style.setAttribute("data-prompt-enhancer", "");
+      style.textContent = SHIMMER_CSS;
+      document.head.appendChild(style);
+      return () => style.remove();
+    },
   });
 });

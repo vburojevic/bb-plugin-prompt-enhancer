@@ -10,7 +10,7 @@
     "name": "Prompt Enhancer",
     "description": "Rewrites the composer draft into a clearer, more effective prompt using a hidden bb thread.",
     "branding": {
-      "icon": "Zap"
+      "icon": "AiContentGenerator01"
     },
     "server": "./server.ts",
     "app": "./app.tsx"
