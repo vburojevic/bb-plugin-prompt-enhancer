@@ -65,9 +65,10 @@ const modelOverrideSchema = z.object({
 });
 type ModelOverride = z.infer<typeof modelOverrideSchema>;
 
-const STYLE_KEY = "enhance-style";
-const styleSchema = z.enum(["tighten", "spec", "criteria", "translate"]);
-type EnhanceStyle = z.infer<typeof styleSchema>;
+/** How often the child thread's partial output is polled while pending. */
+const PROGRESS_POLL_MS = 650;
+/** Progress polling stops unconditionally after this long. */
+const PROGRESS_MAX_MS = 100_000;
 
 /** Tail of the scope thread's last output shown to the rewriter as context. */
 const CONTEXT_OUTPUT_CAP = 1500;
@@ -125,14 +126,7 @@ export const rpcContract = defineRpcContract({
   },
   getPrefs: {
     input: z.null(),
-    output: z.object({
-      style: styleSchema,
-      previewBeforeApply: z.boolean(),
-    }),
-  },
-  setStyle: {
-    input: z.object({ style: styleSchema }).strict(),
-    output: z.object({}),
+    output: z.object({ previewBeforeApply: z.boolean() }),
   },
 });
 
@@ -162,23 +156,12 @@ function toEnhancement(row: EnhancementRow): Enhancement {
 
 interface EnhanceContext {
   kind: "new-task" | "follow-up";
-  style: EnhanceStyle;
   attachmentCount: number;
   threadTitle: string | null;
   /** Tail of the scope thread's latest assistant output, already capped. */
   lastOutput: string | null;
   customInstructions: string | null;
 }
-
-const STYLE_BRIEFS: Record<EnhanceStyle, string> = {
-  tighten:
-    "Style: tighten. Match length to substance — a one-line ask stays roughly one line; use structure (goal, constraints, what a good result looks like) only for genuinely multi-part work.",
-  spec: "Style: expand into a spec. Turn the draft into a complete task brief: the goal, the constraints the draft implies, and explicit acceptance criteria. Use short headings or bullets; still add nothing the draft does not imply.",
-  criteria:
-    "Style: add acceptance criteria. Keep the draft's wording essentially intact — clean it up only where unclear — then append a short 'Done when:' list of the concrete, checkable outcomes the draft implies.",
-  translate:
-    "Style: translate to English. Render the draft in clear, natural English regardless of its original language, preserving every technical token verbatim. Beyond translation, only tighten obvious noise — do not restructure.",
-};
 
 /**
  * The two composer situations produce very different "best prompts": a
@@ -213,12 +196,10 @@ function buildEnhancePrompt(draft: string, ctx: EnhanceContext): string {
     "Rules:",
     "- Preserve the draft's intent and meaning exactly; never invent requirements, constraints, file names, or technologies the draft does not imply.",
     "- Preserve verbatim every @mention, file path, identifier, code snippet, shell command, URL, and quoted string — they are live references that must survive untouched.",
-    `- ${STYLE_BRIEFS[ctx.style]}`,
+    "- Choose the rewrite's shape from the draft itself: a simple ask stays roughly one line; genuinely multi-part work becomes a short brief (goal, constraints, acceptance criteria); append a 'Done when:' list only when the draft implies concrete, checkable outcomes.",
     "- Prefer concrete, actionable phrasing: what to do, where, and how to tell it's done.",
+    "- Keep the same language the draft is written in.",
   );
-  if (ctx.style !== "translate") {
-    lines.push("- Keep the same language the draft is written in.");
-  }
   if (ctx.attachmentCount > 0) {
     lines.push(
       `- The draft carries ${ctx.attachmentCount} attachment(s) you cannot see. Keep every reference to them intact and never invent or describe their contents.`,
@@ -329,6 +310,58 @@ export default async function plugin(bb: BbPluginApi) {
   function fail(id: string, message: string) {
     markError.run(message, id);
     publish(id, "error");
+  }
+
+  // ---------------------------------------------------------------------
+  // Live progress: no delta events exist in the plugin SDK, so while an
+  // enhancement is pending we poll the child thread's partial output and
+  // relay growth to the composer. Chunky (~0.6s) but genuine tokens.
+  // ---------------------------------------------------------------------
+  const progressTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+  function stopProgress(id: string): void {
+    const timer = progressTimers.get(id);
+    if (timer !== undefined) {
+      clearInterval(timer);
+      progressTimers.delete(id);
+    }
+  }
+
+  function startProgress(id: string, childThreadId: string): void {
+    const startedAt = Date.now();
+    let lastPublished = "";
+    const timer = setInterval(() => {
+      void (async () => {
+        try {
+          const row = byId.get(id) as EnhancementRow | undefined;
+          if (
+            row === undefined ||
+            row.status !== "pending" ||
+            Date.now() - startedAt > PROGRESS_MAX_MS
+          ) {
+            stopProgress(id);
+            return;
+          }
+          const { output } = await bb.sdk.threads.output({
+            threadId: childThreadId,
+          });
+          const text = output ?? "";
+          if (text.length > 0 && text !== lastPublished) {
+            lastPublished = text;
+            bb.realtime.publish(REALTIME_CHANNEL, {
+              id,
+              status: "progress",
+              text,
+            });
+          }
+        } catch {
+          // Stale handle or the child is gone — either way stop polling;
+          // the lifecycle events still resolve the enhancement.
+          stopProgress(id);
+        }
+      })();
+    }, PROGRESS_POLL_MS);
+    progressTimers.set(id, timer);
   }
 
   // Provider/model catalog. Menu opens always answer from cache; a stale
@@ -471,12 +504,10 @@ export default async function plugin(bb: BbPluginApi) {
       if (resolvedProjectId === null) {
         throw new Error("No project available to run the enhancement in");
       }
-      const [override, storedStyle, settingsValues] = await Promise.all([
+      const [override, settingsValues] = await Promise.all([
         bb.storage.kv.get<ModelOverride>(OVERRIDE_KEY).then((v) => v ?? null),
-        bb.storage.kv.get<unknown>(STYLE_KEY),
         settings.get(),
       ]);
-      const style = styleSchema.catch("tighten").parse(storedStyle);
       const customRaw = (settingsValues.customInstructions ?? "").trim();
       const customInstructions =
         customRaw.length > 0
@@ -501,7 +532,6 @@ export default async function plugin(bb: BbPluginApi) {
         title: "Enhance prompt",
         prompt: buildEnhancePrompt(text, {
           kind: threadId === null ? "new-task" : "follow-up",
-          style,
           attachmentCount,
           threadTitle,
           lastOutput,
@@ -514,6 +544,8 @@ export default async function plugin(bb: BbPluginApi) {
       const row = byId.get(id) as EnhancementRow | undefined;
       if (row === undefined || row.status !== "pending") {
         cleanupChildThread(child.id);
+      } else {
+        startProgress(id, child.id);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -542,6 +574,7 @@ export default async function plugin(bb: BbPluginApi) {
       const row = byId.get(id) as EnhancementRow | undefined;
       if (row === undefined || row.status !== "pending") return {};
       markCancelled.run(id);
+      stopProgress(id);
       cleanupChildThread(row.child_thread_id);
       return {};
     },
@@ -582,24 +615,15 @@ export default async function plugin(bb: BbPluginApi) {
       return {};
     },
     async getPrefs() {
-      const [storedStyle, settingsValues] = await Promise.all([
-        bb.storage.kv.get<unknown>(STYLE_KEY),
-        settings.get(),
-      ]);
-      return {
-        style: styleSchema.catch("tighten").parse(storedStyle),
-        previewBeforeApply: settingsValues.previewBeforeApply,
-      };
-    },
-    async setStyle({ style }) {
-      await bb.storage.kv.set(STYLE_KEY, style);
-      return {};
+      const settingsValues = await settings.get();
+      return { previewBeforeApply: settingsValues.previewBeforeApply };
     },
   });
 
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
     const row = pendingByChild.get(thread.id) as EnhancementRow | undefined;
     if (!row) return;
+    stopProgress(row.id);
     const enhanced = (lastAssistantText ?? "").trim();
     if (enhanced.length === 0) {
       fail(row.id, "The enhancement thread returned an empty response");
@@ -613,6 +637,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("thread.failed", ({ thread, error }) => {
     const row = pendingByChild.get(thread.id) as EnhancementRow | undefined;
     if (!row) return;
+    stopProgress(row.id);
     fail(row.id, error ?? "The enhancement thread failed");
     cleanupChildThread(thread.id);
   });
