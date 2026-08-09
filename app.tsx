@@ -6,8 +6,10 @@
 // explicit provider+model for the enhancement (default: inherit the current
 // thread's provider, or the project default on the new-thread composer).
 // While an enhancement runs, the control shimmers and the draft gets an
-// animated text effect; the rewrite then streams into the composer and
-// settles with a one-shot accent sweep.
+// animated text effect; the spark half doubles as a cancel button. The
+// rewrite then streams into the composer, settles with a one-shot accent
+// sweep, and offers Undo via the success toast. All motion collapses to
+// instant replacement under prefers-reduced-motion.
 //
 // The catalog + selection live in a module store: one fetch per window,
 // shared by every composer instance (a per-instance fetch would turn every
@@ -42,11 +44,24 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
 
 const TIMEOUT_MS = 90_000;
-/** Total time the rewritten draft takes to stream into the composer. */
-const STREAM_MS = 900;
 const STREAM_TICK_MS = 24;
+/** Reveal duration scales with rewrite length so short rewrites feel snappy. */
+function streamDurationMs(length: number): number {
+  return Math.min(1400, Math.max(350, length * 5));
+}
+const isMac = navigator.platform.toUpperCase().includes("MAC");
+const SHORTCUT_HINT = isMac ? "⌘E" : "Ctrl+E";
 /** How long the one-shot settle sweep plays before the draft returns to normal. */
 const SETTLE_MS = 1100;
 
@@ -65,7 +80,15 @@ interface ModelCatalog {
     models: { model: string; displayName: string; isDefault: boolean }[];
   }[];
 }
+type EnhanceStyle = "tighten" | "spec" | "criteria" | "translate";
 type Rpc = ReturnType<typeof useRpc<typeof rpcContract>>;
+
+const STYLE_LABELS: { style: EnhanceStyle; label: string; hint?: string }[] = [
+  { style: "tighten", label: "Tighten", hint: "default" },
+  { style: "spec", label: "Expand into spec" },
+  { style: "criteria", label: "Add acceptance criteria" },
+  { style: "translate", label: "Translate to English" },
+];
 
 // ---------------------------------------------------------------------------
 // Shared catalog/selection store (per window)
@@ -73,14 +96,19 @@ type Rpc = ReturnType<typeof useRpc<typeof rpcContract>>;
 
 interface PickerState {
   loaded: boolean;
+  /** The last load attempt failed; the next picker open retries. */
+  failed: boolean;
   catalog: ModelCatalog | null;
   override: ModelOverride | null;
+  style: EnhanceStyle;
 }
 
 let pickerState: PickerState = {
   loaded: false,
+  failed: false,
   catalog: null,
   override: null,
+  style: "tighten",
 };
 let pickerInflight: Promise<void> | null = null;
 const pickerListeners = new Set<() => void>();
@@ -97,19 +125,29 @@ function pickerNotify(): void {
 /** Single shared fetch; safe to call from every composer instance. */
 function ensurePickerLoaded(rpc: Rpc): void {
   if (pickerState.loaded || pickerInflight !== null) return;
+  if (pickerState.failed) {
+    // A retry is starting — show "Loading…" again instead of the stale error.
+    pickerState = { ...pickerState, failed: false };
+    pickerNotify();
+  }
   pickerInflight = (async () => {
     try {
-      const [modelsResult, overrideResult] = await Promise.all([
+      const [modelsResult, overrideResult, prefsResult] = await Promise.all([
         rpc.call("listModels"),
         rpc.call("getModelOverride"),
+        rpc.call("getPrefs"),
       ]);
       pickerState = {
         loaded: true,
+        failed: false,
         catalog: modelsResult,
         override: overrideResult.override,
+        style: prefsResult.style,
       };
     } catch {
-      // Leave unloaded — the next picker open retries.
+      // Leave unloaded but flag the failure so the picker can say so
+      // instead of showing an eternal "Loading…"; the next open retries.
+      pickerState = { ...pickerState, failed: true };
     } finally {
       pickerInflight = null;
       pickerNotify();
@@ -119,6 +157,11 @@ function ensurePickerLoaded(rpc: Rpc): void {
 
 function setSharedOverride(next: ModelOverride | null): void {
   pickerState = { ...pickerState, override: next };
+  pickerNotify();
+}
+
+function setSharedStyle(next: EnhanceStyle): void {
+  pickerState = { ...pickerState, style: next };
   pickerNotify();
 }
 
@@ -154,8 +197,11 @@ const SHIMMER_CSS = `
   animation: prompt-enhancer-sweep 1.4s linear infinite;
 }
 .prompt-enhancer-draft {
+  /* 90deg on purpose: the gradient must vary along x only, so the bright
+     band crosses every wrapped line at the same spot. A diagonal band hits
+     each line at a different x and reads as blotches on multi-line drafts. */
   background-image: linear-gradient(
-    110deg,
+    90deg,
     color-mix(in oklab, var(--foreground) 55%, transparent) 30%,
     var(--foreground) 50%,
     color-mix(in oklab, var(--foreground) 55%, transparent) 70%
@@ -167,8 +213,9 @@ const SHIMMER_CSS = `
   animation: prompt-enhancer-sweep 1.4s linear infinite;
 }
 .prompt-enhancer-settle {
+  /* 90deg for the same multi-line reason as .prompt-enhancer-draft. */
   background-image: linear-gradient(
-    110deg,
+    90deg,
     var(--foreground) 32%,
     var(--primary) 50%,
     var(--foreground) 68%
@@ -179,7 +226,23 @@ const SHIMMER_CSS = `
   color: transparent;
   animation: prompt-enhancer-sweep 1s ease-in-out 1;
 }
+@media (prefers-reduced-motion: reduce) {
+  .prompt-enhancer-pill-busy,
+  .prompt-enhancer-draft,
+  .prompt-enhancer-settle {
+    animation: none;
+  }
+  .prompt-enhancer-draft,
+  .prompt-enhancer-settle {
+    background-image: none;
+    color: inherit;
+  }
+}
 `;
+
+function prefersReducedMotion(): boolean {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
 
 // ---------------------------------------------------------------------------
 // Composer control
@@ -200,7 +263,16 @@ function EnhanceButton() {
   const view = useComposerView();
   const rpc = useRpc<typeof rpcContract>();
   const [busy, setBusy] = useState(false);
+  const [cancelHover, setCancelHover] = useState(false);
+  const [preview, setPreview] = useState<{
+    original: string;
+    enhanced: string;
+  } | null>(null);
   const pendingIdRef = useRef<string | null>(null);
+  const originalTextRef = useRef<string>("");
+  /** Whether the pending enhancement should preview instead of auto-apply. */
+  const previewGateRef = useRef(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const streamTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -214,7 +286,9 @@ function EnhanceButton() {
     ensurePickerLoaded(rpc);
   }, [rpc]);
 
-  const disabled = busy || view.draft.isEmpty || view.run.isRunning;
+  // While busy the spark half stays enabled — it becomes the cancel button.
+  const startDisabled = busy || view.draft.isEmpty || view.run.isRunning;
+  const disabled = !busy && (view.draft.isEmpty || view.run.isRunning);
 
   const overrideLabel = (() => {
     if (picker.override === null) return null;
@@ -248,8 +322,26 @@ function EnhanceButton() {
     stopTimers();
     pendingIdRef.current = null;
     setBusy(false);
+    setCancelHover(false);
     composer.setInputLock(false);
     composer.setTextEffect(null);
+  }
+
+  /** Success toast with a one-tap way back to the pre-rewrite draft. */
+  function notifyEnhanced(): void {
+    const original = originalTextRef.current;
+    toast.success("Prompt enhanced", {
+      action: {
+        label: "Undo",
+        onClick: () => {
+          try {
+            composer.setText(original);
+          } catch {
+            // Composer scope is gone; nothing to restore into.
+          }
+        },
+      },
+    });
   }
 
   // Input lock and text effect are plugin-scoped and auto-release on
@@ -263,9 +355,30 @@ function EnhanceButton() {
    * rewrite must never be lost to an animation.
    */
   function revealEnhanced(finalText: string): void {
+    // The result is in hand: the request can no longer be cancelled or time
+    // out. Null the pending id so a late timeout or a cancel click during
+    // the reveal can't clobber the stream and lose the rewrite.
+    pendingIdRef.current = null;
+    if (timeoutRef.current !== null) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+    if (prefersReducedMotion()) {
+      try {
+        composer.setText(finalText);
+        composer.focus();
+      } catch {
+        // Composer gone mid-flight; the host already released lock/effect.
+      }
+      notifyEnhanced();
+      clearPending();
+      return;
+    }
     const step = Math.max(
       1,
-      Math.ceil(finalText.length / (STREAM_MS / STREAM_TICK_MS)),
+      Math.ceil(
+        finalText.length / (streamDurationMs(finalText.length) / STREAM_TICK_MS),
+      ),
     );
     let shown = 0;
     streamTimerRef.current = setInterval(() => {
@@ -278,8 +391,15 @@ function EnhanceButton() {
             streamTimerRef.current = null;
           }
           composer.setTextEffect({ className: "prompt-enhancer-settle" });
-          toast.success("Prompt enhanced");
-          settleTimerRef.current = setTimeout(clearPending, SETTLE_MS);
+          notifyEnhanced();
+          settleTimerRef.current = setTimeout(() => {
+            clearPending();
+            try {
+              composer.focus();
+            } catch {
+              // Composer gone; focus is best-effort.
+            }
+          }, SETTLE_MS);
         }
       } catch {
         // The composer went away mid-stream (scope change/unmount) — nothing
@@ -304,6 +424,16 @@ function EnhanceButton() {
           id: pendingId,
         });
         if (enhancement?.status === "done" && enhancement.enhanced) {
+          if (previewGateRef.current) {
+            // Review mode: release the composer untouched and let the user
+            // decide in the preview dialog.
+            clearPending();
+            setPreview({
+              original: originalTextRef.current,
+              enhanced: enhancement.enhanced,
+            });
+            return;
+          }
           // The stream now owns the lock; it clears pending when done.
           revealEnhanced(enhancement.enhanced);
           return;
@@ -322,7 +452,7 @@ function EnhanceButton() {
 
   async function enhance(): Promise<void> {
     const text = composer.text.trim();
-    if (!text || disabled) return;
+    if (!text || startDisabled) return;
     // Every composer flavor that knows its thread hands it over so the
     // enhancement inherits that thread's provider; only the new-thread
     // composer falls back to the project default.
@@ -334,12 +464,19 @@ function EnhanceButton() {
           ? (scope.childThreadId ?? scope.parentThreadId)
           : null;
     const scopeProjectId = scope.kind === "new-thread" ? scope.projectId : null;
+    // Read the preview toggle fresh per run so a settings change applies to
+    // the very next enhancement, not the next window load.
+    previewGateRef.current = await rpc
+      .call("getPrefs")
+      .then((prefs) => prefs.previewBeforeApply)
+      .catch(() => false);
     let id: string;
     try {
       ({ id } = await rpc.call("startEnhance", {
         text,
         threadId: scopeThreadId,
         projectId: scopeProjectId,
+        attachmentCount: view.draft.attachmentCount,
       }));
     } catch (error) {
       toast.error(
@@ -348,15 +485,89 @@ function EnhanceButton() {
       return;
     }
     pendingIdRef.current = id;
+    originalTextRef.current = composer.text;
     setBusy(true);
     composer.setInputLock(true);
     composer.setTextEffect({ className: "prompt-enhancer-draft" });
     timeoutRef.current = setTimeout(() => {
       if (pendingIdRef.current === id) {
+        // Tell the backend too so the hidden thread is stopped and reaped,
+        // not left running toward a result nobody will read.
+        void rpc.call("cancelEnhance", { id }).catch(() => {});
         clearPending();
         toast.error("Enhancement timed out");
       }
     }, TIMEOUT_MS);
+  }
+
+  function cancel(): void {
+    const id = pendingIdRef.current;
+    if (id === null) return;
+    void rpc.call("cancelEnhance", { id }).catch(() => {});
+    clearPending();
+    toast("Enhancement cancelled");
+  }
+
+  function applyPreview(): void {
+    if (preview === null) return;
+    const { enhanced } = preview;
+    setPreview(null);
+    try {
+      composer.setText(enhanced);
+      composer.setTextEffect({ className: "prompt-enhancer-settle" });
+      composer.focus();
+    } catch {
+      // Composer gone; nothing to apply into.
+      return;
+    }
+    notifyEnhanced();
+    settleTimerRef.current = setTimeout(() => {
+      try {
+        composer.setTextEffect(null);
+      } catch {
+        // Composer gone; the host released the effect already.
+      }
+    }, SETTLE_MS);
+  }
+
+  function discardPreview(): void {
+    setPreview(null);
+    toast("Rewrite discarded");
+  }
+
+  // Cmd/Ctrl+E enhances from the keyboard. Ownership: only the instance whose
+  // composer contains the focused editor may react, so multiple mounted
+  // composers (thread, side chat) never double-fire.
+  const enhanceRef = useRef<() => void>(() => {});
+  enhanceRef.current = () => void enhance();
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent): void {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey)
+        return;
+      if (event.key.toLowerCase() !== "e") return;
+      const container = rootRef.current?.closest("[data-promptbox-main]");
+      const active = document.activeElement;
+      if (!container || active === null || !container.contains(active)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      enhanceRef.current();
+    }
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, []);
+
+  async function selectStyle(next: EnhanceStyle): Promise<void> {
+    setPickerOpen(false);
+    try {
+      await rpc.call("setStyle", { style: next });
+      setSharedStyle(next);
+      const label = STYLE_LABELS.find((entry) => entry.style === next)?.label;
+      toast.success(`Enhancer style: ${label ?? next}`);
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to save the style",
+      );
+    }
   }
 
   async function selectOverride(next: ModelOverride | null): Promise<void> {
@@ -378,8 +589,10 @@ function EnhanceButton() {
 
   return (
     <div
+      ref={rootRef}
       role="group"
       aria-label="Prompt enhancer"
+      aria-busy={busy}
       className={cn(
         "flex items-center overflow-hidden rounded-md border border-input",
         busy && "prompt-enhancer-pill-busy",
@@ -389,17 +602,21 @@ function EnhanceButton() {
         type="button"
         className={groupHalfClass("w-7")}
         disabled={disabled}
-        onClick={() => void enhance()}
-        aria-label="Enhance prompt"
+        onClick={() => (busy ? cancel() : void enhance())}
+        onMouseEnter={() => setCancelHover(true)}
+        onMouseLeave={() => setCancelHover(false)}
+        aria-label={busy ? "Cancel enhancement" : "Enhance prompt"}
         title={
-          overrideLabel === null
-            ? "Enhance prompt"
-            : `Enhance prompt (${overrideLabel})`
+          busy
+            ? "Cancel enhancement"
+            : overrideLabel === null
+              ? `Enhance prompt (${SHORTCUT_HINT})`
+              : `Enhance prompt (${SHORTCUT_HINT}) — ${overrideLabel}`
         }
       >
         <Icon
-          name={busy ? "Loading" : "AiContentGenerator01"}
-          className={cn("size-4", busy && "animate-spin")}
+          name={busy ? (cancelHover ? "X" : "Loading") : "AiContentGenerator01"}
+          className={cn("size-4", busy && !cancelHover && "animate-spin")}
           aria-hidden
         />
       </button>
@@ -415,8 +632,16 @@ function EnhanceButton() {
           <button
             type="button"
             className={groupHalfClass("w-5")}
-            aria-label="Choose enhancer model"
-            title="Choose enhancer model"
+            aria-label={
+              overrideLabel === null
+                ? "Choose enhancer model"
+                : `Choose enhancer model (currently ${overrideLabel})`
+            }
+            title={
+              overrideLabel === null
+                ? "Choose enhancer model"
+                : `Enhancer model: ${overrideLabel}`
+            }
           >
             <Icon name="ChevronDown" className="size-3.5" aria-hidden />
           </button>
@@ -428,7 +653,9 @@ function EnhanceButton() {
               <CommandEmpty>
                 {picker.loaded
                   ? "No models match your search."
-                  : "Loading models…"}
+                  : picker.failed
+                    ? "Couldn't load models. Close and reopen to retry."
+                    : "Loading models…"}
               </CommandEmpty>
               <CommandGroup heading="General">
                 <CommandItem
@@ -446,6 +673,28 @@ function EnhanceButton() {
                     inherit
                   </span>
                 </CommandItem>
+              </CommandGroup>
+              <CommandGroup heading="Style">
+                {STYLE_LABELS.map(({ style, label, hint }) => (
+                  <CommandItem
+                    key={style}
+                    value={`style-${style}`}
+                    keywords={["style", label]}
+                    onSelect={() => void selectStyle(style)}
+                  >
+                    <Icon
+                      name="Check"
+                      className={picker.style === style ? undefined : "invisible"}
+                      aria-hidden
+                    />
+                    <span className="truncate">{label}</span>
+                    {hint !== undefined ? (
+                      <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+                        {hint}
+                      </span>
+                    ) : null}
+                  </CommandItem>
+                ))}
               </CommandGroup>
               {picker.catalog?.providers.map((provider) => (
                 <CommandGroup key={provider.id} heading={provider.displayName}>
@@ -490,6 +739,45 @@ function EnhanceButton() {
           </Command>
         </PopoverContent>
       </Popover>
+      <Dialog
+        open={preview !== null}
+        onOpenChange={(open) => {
+          if (!open) discardPreview();
+        }}
+      >
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Review enhanced prompt</DialogTitle>
+            <DialogDescription>
+              Apply replaces your draft — Undo stays available in the toast.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex min-h-0 flex-col gap-3">
+            <div>
+              <div className="mb-1 text-xs font-medium text-muted-foreground">
+                Original
+              </div>
+              <div className="max-h-32 overflow-y-auto whitespace-pre-wrap rounded-md border border-input bg-muted/40 p-2 text-xs text-muted-foreground">
+                {preview?.original}
+              </div>
+            </div>
+            <div>
+              <div className="mb-1 text-xs font-medium text-muted-foreground">
+                Enhanced
+              </div>
+              <div className="max-h-48 overflow-y-auto whitespace-pre-wrap rounded-md border border-input p-2 text-sm">
+                {preview?.enhanced}
+              </div>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={discardPreview}>
+              Discard
+            </Button>
+            <Button onClick={applyPreview}>Apply</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

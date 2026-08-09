@@ -9,7 +9,27 @@ is the AI.
 
 The ▾ chevron next to the action opens the enhancer model picker: pin an
 explicit provider+model for the rewrite, or leave it on "Provider default"
-to inherit.
+to inherit. The chevron's tooltip shows the pinned model, if any.
+
+While a rewrite runs, the spark doubles as a cancel button (hover shows ✕).
+After a rewrite lands, the success toast offers **Undo** to restore the
+original draft. Hidden enhancement threads are stopped and deleted as soon
+as they resolve, so they never accumulate. All animation collapses to an
+instant text swap under `prefers-reduced-motion`.
+
+More:
+
+- **⌘E / Ctrl+E** enhances from the keyboard when the composer is focused.
+- The picker's **Style** group picks the rewrite shape: Tighten (default),
+  Expand into spec, Add acceptance criteria, Translate to English.
+- Follow-up drafts in a thread include the thread title and the tail of the
+  last assistant message as context, so "that bug" resolves to the actual bug.
+- The rewriter is told how many attachments the draft carries so it never
+  invents or drops references to them.
+- Settings (`bb plugin config prompt-enhancer`):
+  - `previewBeforeApply` (default off) — review the rewrite in an
+    Apply/Discard dialog instead of replacing the draft immediately.
+  - `customInstructions` — extra instruction appended to every rewrite.
 
 ## UI components
 
