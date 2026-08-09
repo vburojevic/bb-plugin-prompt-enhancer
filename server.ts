@@ -66,7 +66,7 @@ const modelOverrideSchema = z.object({
 type ModelOverride = z.infer<typeof modelOverrideSchema>;
 
 /** How often the child thread's partial output is polled while pending. */
-const PROGRESS_POLL_MS = 650;
+const PROGRESS_POLL_MS = 400;
 /** Progress polling stops unconditionally after this long. */
 const PROGRESS_MAX_MS = 100_000;
 
@@ -346,7 +346,9 @@ export default async function plugin(bb: BbPluginApi) {
             threadId: childThreadId,
           });
           const text = output ?? "";
-          if (text.length > 0 && text !== lastPublished) {
+          // Monotonic: only growth is relayed, so the composer never sees
+          // the text shrink or flicker between event-assembly states.
+          if (text.length > lastPublished.length) {
             lastPublished = text;
             bb.realtime.publish(REALTIME_CHANNEL, {
               id,

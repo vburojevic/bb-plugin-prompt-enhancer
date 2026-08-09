@@ -55,15 +55,20 @@ import {
 import { Button } from "@/components/ui/button";
 
 const TIMEOUT_MS = 90_000;
-const STREAM_TICK_MS = 24;
-/** Reveal duration scales with rewrite length so short rewrites feel snappy. */
-function streamDurationMs(length: number): number {
-  return Math.min(1400, Math.max(350, length * 5));
-}
 const isMac = navigator.platform.toUpperCase().includes("MAC");
 const SHORTCUT_HINT = isMac ? "⌘E" : "Ctrl+E";
-/** How long the one-shot settle sweep plays before the draft returns to normal. */
-const SETTLE_MS = 1100;
+
+// Reveal engine. One adaptive typewriter for every arrival pattern: text can
+// land as one block (the SDK only surfaces *completed* messages) or in
+// chunks, and either way it flows in smoothly — each tick reveals a fraction
+// of what remains, so big arrivals accelerate and the tail eases out.
+const REVEAL_TICK_MS = 24;
+/** Fraction of the remaining text revealed per tick (ease-out catch-up). */
+const REVEAL_CATCH_UP = 0.1;
+/** Minimum characters per tick so the tail never crawls. */
+const REVEAL_MIN_STEP = 2;
+/** One-shot settle sweep duration; keep in sync with the CSS animation. */
+const SETTLE_MS = 950;
 
 interface EnhanceSignal {
   id?: string;
@@ -211,12 +216,13 @@ const SHIMMER_CSS = `
 .prompt-enhancer-draft {
   /* 90deg on purpose: the gradient must vary along x only, so the bright
      band crosses every wrapped line at the same spot. A diagonal band hits
-     each line at a different x and reads as blotches on multi-line drafts. */
+     each line at a different x and reads as blotches on multi-line drafts.
+     65% floor keeps the waiting draft clearly readable while it shimmers. */
   background-image: linear-gradient(
     90deg,
-    color-mix(in oklab, var(--foreground) 55%, transparent) 30%,
+    color-mix(in oklab, var(--foreground) 65%, transparent) 30%,
     var(--foreground) 50%,
-    color-mix(in oklab, var(--foreground) 55%, transparent) 70%
+    color-mix(in oklab, var(--foreground) 65%, transparent) 70%
   );
   background-size: 220% 100%;
   background-clip: text;
@@ -236,7 +242,7 @@ const SHIMMER_CSS = `
   background-clip: text;
   -webkit-background-clip: text;
   color: transparent;
-  animation: prompt-enhancer-sweep 1s ease-in-out 1;
+  animation: prompt-enhancer-sweep 0.9s cubic-bezier(0.16, 1, 0.3, 1) 1;
 }
 @media (prefers-reduced-motion: reduce) {
   .prompt-enhancer-pill-busy,
@@ -263,8 +269,10 @@ function prefersReducedMotion(): boolean {
 /** One half of the split control — chrome comes from the group wrapper. */
 function groupHalfClass(extra?: string): string {
   return cn(
-    "flex h-7 items-center justify-center text-muted-foreground transition-colors",
+    "flex h-7 items-center justify-center text-muted-foreground",
+    "transition-[color,background-color,transform] duration-150",
     "hover:bg-state-hover hover:text-foreground",
+    "active:scale-95 motion-reduce:transition-none motion-reduce:active:scale-100",
     "disabled:pointer-events-none disabled:opacity-50",
     extra,
   );
@@ -284,11 +292,15 @@ function EnhanceButton() {
   const originalTextRef = useRef<string>("");
   /** Whether the pending enhancement should preview instead of auto-apply. */
   const previewGateRef = useRef(false);
-  /** True once live progress text has painted into the composer. */
-  const liveRef = useRef(false);
+  /** Live reveal state; null when no reveal is running. */
+  const revealRef = useRef<{
+    target: string;
+    shown: number;
+    done: boolean;
+  } | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const streamTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const revealTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -322,10 +334,11 @@ function EnhanceButton() {
       clearTimeout(timeoutRef.current);
       timeoutRef.current = null;
     }
-    if (streamTimerRef.current !== null) {
-      clearInterval(streamTimerRef.current);
-      streamTimerRef.current = null;
+    if (revealTimerRef.current !== null) {
+      clearInterval(revealTimerRef.current);
+      revealTimerRef.current = null;
     }
+    revealRef.current = null;
     if (settleTimerRef.current !== null) {
       clearTimeout(settleTimerRef.current);
       settleTimerRef.current = null;
@@ -342,12 +355,17 @@ function EnhanceButton() {
   }
 
   /**
-   * A cancelled/failed/timed-out run may have live-streamed partial output
-   * into the composer; the draft must come back, not the half-rewrite.
+   * A cancelled/failed/timed-out run may have revealed partial output into
+   * the composer; the draft must come back, not the half-rewrite.
    */
-  function restoreOriginalIfLive(): void {
-    if (!liveRef.current) return;
-    liveRef.current = false;
+  function abortReveal(): void {
+    const hadReveal = revealRef.current !== null;
+    if (revealTimerRef.current !== null) {
+      clearInterval(revealTimerRef.current);
+      revealTimerRef.current = null;
+    }
+    revealRef.current = null;
+    if (!hadReveal) return;
     try {
       composer.setText(originalTextRef.current);
     } catch {
@@ -379,101 +397,107 @@ function EnhanceButton() {
     }
   }
 
-  /** Final text is in hand: replace, sweep, notify — no fake streaming. */
-  function finishInstantly(finalText: string): void {
-    try {
-      composer.setText(finalText);
-      composer.focus();
-    } catch {
-      // Composer gone mid-flight; the host already released lock/effect.
-      notifyEnhanced(finalText);
-      clearPending();
-      return;
-    }
-    notifyEnhanced(finalText);
-    stopTimers();
-    pendingIdRef.current = null;
-    setBusy(false);
-    setCancelHover(false);
-    composer.setInputLock(false);
-    composer.setTextEffect({ className: "prompt-enhancer-settle" });
-    settleTimerRef.current = setTimeout(() => {
-      try {
-        composer.setTextEffect(null);
-      } catch {
-        // Composer gone; the host released the effect already.
-      }
-    }, SETTLE_MS);
-  }
-
   // Input lock and text effect are plugin-scoped and auto-release on
   // unmount/scope change; the timers need explicit cleanup.
   useEffect(() => stopTimers, []);
 
-  /**
-   * Reveal the rewrite: stream it into the locked composer while the shimmer
-   * keeps running, then play one accent sweep through the final text and
-   * release everything. Any failure falls back to an instant setText — the
-   * rewrite must never be lost to an animation.
-   */
-  function revealEnhanced(finalText: string): void {
-    // The result is in hand: the request can no longer be cancelled or time
-    // out. Null the pending id so a late timeout or a cancel click during
-    // the reveal can't clobber the stream and lose the rewrite.
-    pendingIdRef.current = null;
-    if (timeoutRef.current !== null) {
-      clearTimeout(timeoutRef.current);
-      timeoutRef.current = null;
+  /** The reveal reached its final text: sweep, notify, release. */
+  function completeReveal(finalText: string): void {
+    if (revealTimerRef.current !== null) {
+      clearInterval(revealTimerRef.current);
+      revealTimerRef.current = null;
     }
-    if (prefersReducedMotion()) {
+    revealRef.current = null;
+    setBusy(false);
+    setCancelHover(false);
+    composer.setInputLock(false);
+    composer.setTextEffect({ className: "prompt-enhancer-settle" });
+    notifyEnhanced(finalText);
+    settleTimerRef.current = setTimeout(() => {
       try {
-        composer.setText(finalText);
+        composer.setTextEffect(null);
         composer.focus();
       } catch {
-        // Composer gone mid-flight; the host already released lock/effect.
+        // Composer gone; the host released lock and effect already.
       }
-      notifyEnhanced(finalText);
-      clearPending();
+    }, SETTLE_MS);
+  }
+
+  /**
+   * Feed text into the reveal engine. Called with partial output as it
+   * arrives and with the final text (done=true); the engine types toward
+   * whatever the current target is, easing out as it catches up, so one big
+   * block and a trickle of chunks look equally alive. Any failure falls back
+   * to an instant setText — the rewrite must never be lost to an animation.
+   */
+  function feedReveal(text: string, done: boolean): void {
+    if (done) {
+      // The result is in hand: it can no longer be cancelled or time out.
+      pendingIdRef.current = null;
+      if (timeoutRef.current !== null) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+    }
+    if (prefersReducedMotion()) {
+      // Reduced motion: no typing choreography, content lands instantly.
+      try {
+        composer.setText(text);
+      } catch {
+        // Composer gone mid-flight; the host released lock/effect.
+      }
+      if (done) {
+        revealRef.current = null;
+        notifyEnhanced(text);
+        clearPending();
+        try {
+          composer.focus();
+        } catch {
+          // Best-effort.
+        }
+      }
       return;
     }
-    const step = Math.max(
-      1,
-      Math.ceil(
-        finalText.length / (streamDurationMs(finalText.length) / STREAM_TICK_MS),
-      ),
-    );
-    let shown = 0;
-    streamTimerRef.current = setInterval(() => {
+    const state = revealRef.current ?? { target: "", shown: 0, done: false };
+    revealRef.current = state;
+    // The final text always wins; partials only ever extend the target.
+    if (done || text.length > state.target.length) state.target = text;
+    if (done) state.done = true;
+    if (revealTimerRef.current !== null) return;
+    // First feed: typing begins — swap the dimmed waiting shimmer for fully
+    // readable text so the arriving rewrite is legible as it types.
+    try {
+      composer.setTextEffect(null);
+    } catch {
+      // Composer gone; the resolution paths handle the rest.
+    }
+    revealTimerRef.current = setInterval(() => {
+      const current = revealRef.current;
+      if (current === null) return;
       try {
-        shown = Math.min(finalText.length, shown + step);
-        composer.setText(finalText.slice(0, shown));
-        if (shown >= finalText.length) {
-          if (streamTimerRef.current !== null) {
-            clearInterval(streamTimerRef.current);
-            streamTimerRef.current = null;
-          }
-          composer.setTextEffect({ className: "prompt-enhancer-settle" });
-          notifyEnhanced(finalText);
-          settleTimerRef.current = setTimeout(() => {
-            clearPending();
-            try {
-              composer.focus();
-            } catch {
-              // Composer gone; focus is best-effort.
-            }
-          }, SETTLE_MS);
+        if (current.shown < current.target.length) {
+          const remaining = current.target.length - current.shown;
+          current.shown = Math.min(
+            current.target.length,
+            current.shown +
+              Math.max(REVEAL_MIN_STEP, Math.ceil(remaining * REVEAL_CATCH_UP)),
+          );
+          composer.setText(current.target.slice(0, current.shown));
+        }
+        if (current.done && current.shown >= current.target.length) {
+          completeReveal(current.target);
         }
       } catch {
-        // The composer went away mid-stream (scope change/unmount) — nothing
-        // safe left to animate; the host has already released lock/effect.
+        // The composer went away mid-reveal (scope change/unmount) — land
+        // the text if at all possible; never lose it to the animation.
         try {
-          composer.setText(finalText);
+          composer.setText(current.target);
         } catch {
-          // truly gone
+          // Truly gone.
         }
         clearPending();
       }
-    }, STREAM_TICK_MS);
+    }, REVEAL_TICK_MS);
   }
 
   useRealtime("prompt-enhancer", (payload) => {
@@ -484,12 +508,7 @@ function EnhanceButton() {
       // Genuine partial output from the child thread. Preview mode keeps the
       // draft untouched until the user applies, so live paint is skipped.
       if (previewGateRef.current || typeof signal.text !== "string") return;
-      try {
-        composer.setText(signal.text);
-        liveRef.current = true;
-      } catch {
-        // Composer gone; the resolution path handles the rest.
-      }
+      feedReveal(signal.text, false);
       return;
     }
     void (async () => {
@@ -508,14 +527,8 @@ function EnhanceButton() {
             });
             return;
           }
-          if (liveRef.current) {
-            // Real tokens already streamed in; just land the final text.
-            finishInstantly(enhancement.enhanced);
-            return;
-          }
-          // Fast model beat the first progress poll — animate the reveal.
-          // The stream now owns the lock; it clears pending when done.
-          revealEnhanced(enhancement.enhanced);
+          // The engine finishes typing whatever remains, then settles.
+          feedReveal(enhancement.enhanced, true);
           return;
         } else if (enhancement?.status === "error") {
           toast.error(enhancement.error ?? "Enhancement failed");
@@ -526,7 +539,7 @@ function EnhanceButton() {
       } catch {
         toast.error("Failed to fetch the enhanced prompt");
       }
-      restoreOriginalIfLive();
+      abortReveal();
       clearPending();
     })();
   });
@@ -567,7 +580,7 @@ function EnhanceButton() {
     }
     pendingIdRef.current = id;
     originalTextRef.current = composer.text;
-    liveRef.current = false;
+    revealRef.current = null;
     setBusy(true);
     composer.setInputLock(true);
     composer.setTextEffect({ className: "prompt-enhancer-draft" });
@@ -576,7 +589,7 @@ function EnhanceButton() {
         // Tell the backend too so the hidden thread is stopped and reaped,
         // not left running toward a result nobody will read.
         void rpc.call("cancelEnhance", { id }).catch(() => {});
-        restoreOriginalIfLive();
+        abortReveal();
         clearPending();
         toast.error("Enhancement timed out");
       }
@@ -587,7 +600,7 @@ function EnhanceButton() {
     const id = pendingIdRef.current;
     if (id === null) return;
     void rpc.call("cancelEnhance", { id }).catch(() => {});
-    restoreOriginalIfLive();
+    abortReveal();
     clearPending();
     toast("Enhancement cancelled");
   }
