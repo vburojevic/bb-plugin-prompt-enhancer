@@ -53,6 +53,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { ResponsiveDrawerShell } from "@/components/ui/responsive-overlay";
+import { blurActiveKeyboardInputBeforeOverlayOpen } from "@/components/ui/overlay-trigger";
+import { useIsCompactViewport } from "@/components/ui/hooks/use-compact-viewport";
+import {
+  COARSE_POINTER_COMPACT_ICON_SIZE_CLASS,
+  COARSE_POINTER_ICON_SIZE_CLASS,
+} from "@/components/ui/coarse-pointer-sizing";
 import {
   formatMissing,
   missingReferences,
@@ -353,6 +360,7 @@ function EnhanceButton() {
   const [pickerOpen, setPickerOpen] = useState(false);
   const picker = usePickerState();
   const myScopeKey = scopeKey(view.scope);
+  const isCompact = useIsCompactViewport();
 
   // Eagerly warm the shared store so the tooltip and check marks reflect the
   // remembered selection without opening the picker first.
@@ -798,69 +806,16 @@ function EnhanceButton() {
     }
   }
 
-  return (
-    <div
-      ref={rootRef}
-      role="group"
-      aria-label="Prompt enhancer"
-      aria-busy={busy}
-      className={cn(
-        "flex items-center overflow-hidden rounded-md border border-input",
-        busy && "prompt-enhancer-pill-busy",
-      )}
-    >
-      <button
-        type="button"
-        className={groupHalfClass("w-7")}
-        disabled={disabled}
-        onClick={() => (busy ? cancel() : void enhance())}
-        onMouseEnter={() => setCancelHover(true)}
-        onMouseLeave={() => setCancelHover(false)}
-        aria-label={busy ? "Cancel enhancement" : "Enhance prompt"}
-        title={
-          busy
-            ? "Cancel enhancement"
-            : overrideLabel === null
-              ? `Enhance prompt (${SHORTCUT_HINT})`
-              : `Enhance prompt (${SHORTCUT_HINT}) — ${overrideLabel}`
-        }
-      >
-        <Icon
-          name={busy ? (cancelHover ? "X" : "Loading") : "AiContentGenerator01"}
-          className={cn("size-4", busy && !cancelHover && "animate-spin")}
-          aria-hidden
-        />
-      </button>
-      <div className="h-4 w-px bg-border" aria-hidden />
-      <Popover
-        open={pickerOpen}
-        onOpenChange={(open) => {
-          setPickerOpen(open);
-          if (open) ensurePickerLoaded(rpc);
-        }}
-      >
-        <PopoverTrigger asChild>
-          <button
-            type="button"
-            className={groupHalfClass("w-5")}
-            aria-label={
-              overrideLabel === null
-                ? "Choose enhancer model"
-                : `Choose enhancer model (currently ${overrideLabel})`
-            }
-            title={
-              overrideLabel === null
-                ? "Choose enhancer model"
-                : `Enhancer model: ${overrideLabel}`
-            }
-          >
-            <Icon name="ChevronDown" className="size-3.5" aria-hidden />
-          </button>
-        </PopoverTrigger>
-        <PopoverContent align="end" className="w-72 p-0">
-          <Command>
+  // One picker body, two shells: popover on desktop, keyboard-aware bottom
+  // sheet on mobile.
+  const pickerBody = (
+    <Command>
             <CommandInput placeholder="Search models…" />
-            <CommandList className="max-h-72">
+            {/* Sheet list is viewport-bounded so the keyboard-lifted drawer
+                keeps its search field and results both on screen. */}
+            <CommandList
+              className={isCompact ? "max-h-[45svh]" : "max-h-72"}
+            >
               <CommandEmpty>
                 {picker.loaded
                   ? "No models match your search."
@@ -986,9 +941,117 @@ function EnhanceButton() {
                 </CommandGroup>
               ))}
             </CommandList>
-          </Command>
-        </PopoverContent>
-      </Popover>
+    </Command>
+  );
+
+  const chevronLabel =
+    overrideLabel === null
+      ? "Choose enhancer model"
+      : `Choose enhancer model (currently ${overrideLabel})`;
+
+  return (
+    <div
+      ref={rootRef}
+      role="group"
+      aria-label="Prompt enhancer"
+      aria-busy={busy}
+      className={cn(
+        "flex items-center overflow-hidden rounded-md border border-input",
+        busy && "prompt-enhancer-pill-busy",
+      )}
+    >
+      <button
+        type="button"
+        className={groupHalfClass(isCompact ? "w-9" : "w-7")}
+        disabled={disabled}
+        onClick={() => (busy ? cancel() : void enhance())}
+        onMouseEnter={() => setCancelHover(true)}
+        onMouseLeave={() => setCancelHover(false)}
+        aria-label={busy ? "Cancel enhancement" : "Enhance prompt"}
+        title={
+          busy
+            ? "Cancel enhancement"
+            : overrideLabel === null
+              ? `Enhance prompt (${SHORTCUT_HINT})`
+              : `Enhance prompt (${SHORTCUT_HINT}) — ${overrideLabel}`
+        }
+      >
+        <Icon
+          name={busy ? (cancelHover ? "X" : "Loading") : "AiContentGenerator01"}
+          className={cn(
+            COARSE_POINTER_ICON_SIZE_CLASS,
+            busy && !cancelHover && "animate-spin",
+          )}
+          aria-hidden
+        />
+      </button>
+      <div className="h-4 w-px bg-border" aria-hidden />
+      {isCompact ? (
+        // Mobile: a keyboard-aware bottom sheet. The vendored Popover's own
+        // compact branch runs its drawer with repositionInputs=false, so
+        // focusing the search field left the list behind the on-screen
+        // keyboard. Driving ResponsiveDrawerShell directly lets vaul lift
+        // the sheet above the keyboard instead.
+        <>
+          <button
+            type="button"
+            className={groupHalfClass("w-9")}
+            aria-haspopup="dialog"
+            aria-expanded={pickerOpen}
+            aria-label={chevronLabel}
+            onClick={() => {
+              blurActiveKeyboardInputBeforeOverlayOpen();
+              ensurePickerLoaded(rpc);
+              setPickerOpen(true);
+            }}
+          >
+            <Icon
+              name="ChevronDown"
+              className={COARSE_POINTER_COMPACT_ICON_SIZE_CLASS}
+              aria-hidden
+            />
+          </button>
+          <ResponsiveDrawerShell
+            open={pickerOpen}
+            onOpenChange={(open) => {
+              setPickerOpen(open);
+              if (open) ensurePickerLoaded(rpc);
+            }}
+            srLabel="Choose enhancer model"
+            repositionInputs
+          >
+            <div className="min-h-0 px-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
+              {pickerBody}
+            </div>
+          </ResponsiveDrawerShell>
+        </>
+      ) : (
+        <Popover
+          open={pickerOpen}
+          onOpenChange={(open) => {
+            setPickerOpen(open);
+            if (open) ensurePickerLoaded(rpc);
+          }}
+        >
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              className={groupHalfClass("w-5")}
+              aria-label={chevronLabel}
+              title={
+                overrideLabel === null
+                  ? "Choose enhancer model"
+                  : `Enhancer model: ${overrideLabel}`
+              }
+            >
+              <Icon name="ChevronDown" className="size-3.5" aria-hidden />
+            </button>
+          </PopoverTrigger>
+          <PopoverContent align="end" className="w-72 p-0">
+            {pickerBody}
+          </PopoverContent>
+        </Popover>
+      )}
       <Dialog
         open={preview !== null}
         onOpenChange={(open) => {
