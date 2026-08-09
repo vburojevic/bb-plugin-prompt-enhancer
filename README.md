@@ -1,6 +1,15 @@
 # bb-plugin-prompt-enhancer
 
-A BB plugin.
+Rewrites the composer's draft prompt into a clearer, more effective prompt —
+in place, in the composer input. Click the ⚡ action in any composer: the
+draft locks briefly while a hidden bb thread (same provider as the current
+thread, or the project default on the new-thread composer) rewrites it, then
+the rewritten text replaces the draft. No external APIs — the hidden thread
+is the AI.
+
+The ▾ chevron next to the action opens the enhancer model picker: pin an
+explicit provider+model for the rewrite, or leave it on "Provider default"
+to inherit.
 
 ## UI components
 

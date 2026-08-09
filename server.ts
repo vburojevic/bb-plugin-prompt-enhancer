@@ -205,6 +205,12 @@ export default async function plugin(bb: BbPluginApi) {
     return catalog;
   }
 
+  // Pre-warm the catalog so the first dropdown open doesn't wait on provider
+  // discovery. Detached: must never reject into the host.
+  void loadModelCatalog().catch(() => {
+    // A cold catalog only means the first menu open fetches it instead.
+  });
+
   /**
    * Detached kickoff. It MUST swallow every error itself: a stale bb handle or
    * a closed db after a plugin reload must never become an unhandled
