@@ -6,7 +6,8 @@
 // explicit provider+model for the enhancement (default: inherit the current
 // thread's provider, or the project default on the new-thread composer).
 // While an enhancement runs, the control shimmers and the draft gets an
-// animated text effect.
+// animated text effect; the rewrite then streams into the composer and
+// settles with a one-shot accent sweep.
 //
 // The catalog + selection live in a module store: one fetch per window,
 // shared by every composer instance (a per-instance fetch would turn every
@@ -43,6 +44,11 @@ import {
 } from "@/components/ui/command";
 
 const TIMEOUT_MS = 90_000;
+/** Total time the rewritten draft takes to stream into the composer. */
+const STREAM_MS = 900;
+const STREAM_TICK_MS = 24;
+/** How long the one-shot settle sweep plays before the draft returns to normal. */
+const SETTLE_MS = 1100;
 
 interface EnhanceSignal {
   id?: string;
@@ -125,9 +131,11 @@ function usePickerState(): PickerState {
 }
 
 // ---------------------------------------------------------------------------
-// Shimmer styles — raw CSS because keyframes cannot come from the Tailwind
+// Animation styles — raw CSS because keyframes cannot come from the Tailwind
 // pass. Injected by a content script (the sanctioned escape hatch), removed
-// on dispose. Colors derive from currentColor only — never hardcoded.
+// on dispose. Colors derive from host theme tokens only — never hardcoded.
+// (Not currentColor for the draft: the gradient-text trick sets
+// color: transparent, which would make currentColor transparent too.)
 // ---------------------------------------------------------------------------
 
 const SHIMMER_CSS = `
@@ -158,6 +166,19 @@ const SHIMMER_CSS = `
   color: transparent;
   animation: prompt-enhancer-sweep 1.4s linear infinite;
 }
+.prompt-enhancer-settle {
+  background-image: linear-gradient(
+    110deg,
+    var(--foreground) 32%,
+    var(--primary) 50%,
+    var(--foreground) 68%
+  );
+  background-size: 220% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  animation: prompt-enhancer-sweep 1s ease-in-out 1;
+}
 `;
 
 // ---------------------------------------------------------------------------
@@ -181,6 +202,8 @@ function EnhanceButton() {
   const [busy, setBusy] = useState(false);
   const pendingIdRef = useRef<string | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const streamTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [pickerOpen, setPickerOpen] = useState(false);
   const picker = usePickerState();
@@ -206,11 +229,23 @@ function EnhanceButton() {
       : `${provider.displayName} · ${model.displayName}`;
   })();
 
-  function clearPending(): void {
+  function stopTimers(): void {
     if (timeoutRef.current !== null) {
       clearTimeout(timeoutRef.current);
       timeoutRef.current = null;
     }
+    if (streamTimerRef.current !== null) {
+      clearInterval(streamTimerRef.current);
+      streamTimerRef.current = null;
+    }
+    if (settleTimerRef.current !== null) {
+      clearTimeout(settleTimerRef.current);
+      settleTimerRef.current = null;
+    }
+  }
+
+  function clearPending(): void {
+    stopTimers();
     pendingIdRef.current = null;
     setBusy(false);
     composer.setInputLock(false);
@@ -218,12 +253,46 @@ function EnhanceButton() {
   }
 
   // Input lock and text effect are plugin-scoped and auto-release on
-  // unmount/scope change; only the timeout needs explicit cleanup.
-  useEffect(() => {
-    return () => {
-      if (timeoutRef.current !== null) clearTimeout(timeoutRef.current);
-    };
-  }, []);
+  // unmount/scope change; the timers need explicit cleanup.
+  useEffect(() => stopTimers, []);
+
+  /**
+   * Reveal the rewrite: stream it into the locked composer while the shimmer
+   * keeps running, then play one accent sweep through the final text and
+   * release everything. Any failure falls back to an instant setText — the
+   * rewrite must never be lost to an animation.
+   */
+  function revealEnhanced(finalText: string): void {
+    const step = Math.max(
+      1,
+      Math.ceil(finalText.length / (STREAM_MS / STREAM_TICK_MS)),
+    );
+    let shown = 0;
+    streamTimerRef.current = setInterval(() => {
+      try {
+        shown = Math.min(finalText.length, shown + step);
+        composer.setText(finalText.slice(0, shown));
+        if (shown >= finalText.length) {
+          if (streamTimerRef.current !== null) {
+            clearInterval(streamTimerRef.current);
+            streamTimerRef.current = null;
+          }
+          composer.setTextEffect({ className: "prompt-enhancer-settle" });
+          toast.success("Prompt enhanced");
+          settleTimerRef.current = setTimeout(clearPending, SETTLE_MS);
+        }
+      } catch {
+        // The composer went away mid-stream (scope change/unmount) — nothing
+        // safe left to animate; the host has already released lock/effect.
+        try {
+          composer.setText(finalText);
+        } catch {
+          // truly gone
+        }
+        clearPending();
+      }
+    }, STREAM_TICK_MS);
+  }
 
   useRealtime("prompt-enhancer", (payload) => {
     const signal = payload as EnhanceSignal;
@@ -235,8 +304,9 @@ function EnhanceButton() {
           id: pendingId,
         });
         if (enhancement?.status === "done" && enhancement.enhanced) {
-          composer.setText(enhancement.enhanced);
-          toast.success("Prompt enhanced");
+          // The stream now owns the lock; it clears pending when done.
+          revealEnhanced(enhancement.enhanced);
+          return;
         } else if (enhancement?.status === "error") {
           toast.error(enhancement.error ?? "Enhancement failed");
         } else {
@@ -429,8 +499,9 @@ export default definePluginApp((app) => {
     id: "prompt-enhancer",
     actions: [{ id: "enhance", component: EnhanceButton }],
   });
-  // Keyframes for the busy shimmer. The Tailwind pass cannot emit raw
-  // keyframes, so a content script injects them and cleans up on dispose.
+  // Keyframes for the busy shimmer and the settle sweep. The Tailwind pass
+  // cannot emit raw keyframes, so a content script injects them and cleans
+  // up on dispose.
   app.contentScripts.register({
     id: "shimmer-styles",
     mount() {
