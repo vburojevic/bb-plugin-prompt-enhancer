@@ -5,12 +5,18 @@
 // (or the project default on the new-thread composer). No external APIs — the
 // hidden thread IS the AI. Completion arrives via thread lifecycle events, so
 // no rpc or event handler ever blocks on an LLM turn.
+//
+// The user can pin an explicit provider+model for the enhancement thread via
+// the composer dropdown; without an override the scope thread's provider is
+// inherited and the model stays at that provider's default.
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 
 /** Draft text is embedded in the child thread's prompt capped at this size. */
 const PROMPT_TEXT_CAP = 8000;
 const REALTIME_CHANNEL = "prompt-enhancer";
+const OVERRIDE_KEY = "model-override";
+const CATALOG_TTL_MS = 60_000;
 
 const enhancementSchema = z.object({
   id: z.string(),
@@ -23,6 +29,29 @@ const enhancementSchema = z.object({
   createdAt: z.number(),
 });
 type Enhancement = z.infer<typeof enhancementSchema>;
+
+const modelOverrideSchema = z.object({
+  providerId: z.string().min(1),
+  model: z.string().min(1),
+});
+type ModelOverride = z.infer<typeof modelOverrideSchema>;
+
+const modelCatalogSchema = z.object({
+  providers: z.array(
+    z.object({
+      id: z.string(),
+      displayName: z.string(),
+      models: z.array(
+        z.object({
+          model: z.string(),
+          displayName: z.string(),
+          isDefault: z.boolean(),
+        }),
+      ),
+    }),
+  ),
+});
+type ModelCatalog = z.infer<typeof modelCatalogSchema>;
 
 export const rpcContract = defineRpcContract({
   startEnhance: {
@@ -38,6 +67,18 @@ export const rpcContract = defineRpcContract({
   getEnhancement: {
     input: z.object({ id: z.string() }).strict(),
     output: z.object({ enhancement: enhancementSchema.nullable() }),
+  },
+  listModels: {
+    input: z.null(),
+    output: modelCatalogSchema,
+  },
+  getModelOverride: {
+    input: z.null(),
+    output: z.object({ override: modelOverrideSchema.nullable() }),
+  },
+  setModelOverride: {
+    input: z.object({ override: modelOverrideSchema.nullable() }).strict(),
+    output: z.object({}),
   },
 });
 
@@ -128,6 +169,42 @@ export default async function plugin(bb: BbPluginApi) {
     publish(id, "error");
   }
 
+  // Provider/model catalog, cached briefly so repeated menu opens stay fast.
+  let catalogCache: { at: number; catalog: ModelCatalog } | null = null;
+
+  async function loadModelCatalog(): Promise<ModelCatalog> {
+    if (catalogCache && Date.now() - catalogCache.at < CATALOG_TTL_MS) {
+      return catalogCache.catalog;
+    }
+    const available = (await bb.sdk.providers.list({})).filter(
+      (provider) => provider.available,
+    );
+    const catalog: ModelCatalog = {
+      providers: (
+        await Promise.all(
+          available.map(async (provider) => {
+            const result = await bb.sdk.providers.models({
+              providerId: provider.id,
+            });
+            return {
+              id: provider.id,
+              displayName: provider.displayName,
+              models: result.models.map((model) => ({
+                model: model.model,
+                displayName: model.displayName,
+                isDefault: model.isDefault,
+              })),
+            };
+          }),
+        )
+        // Providers with an empty catalog (e.g. no curated models) would
+        // render as a bare group heading in the dropdown.
+      ).filter((provider) => provider.models.length > 0),
+    };
+    catalogCache = { at: Date.now(), catalog };
+    return catalog;
+  }
+
   /**
    * Detached kickoff. It MUST swallow every error itself: a stale bb handle or
    * a closed db after a plugin reload must never become an unhandled
@@ -156,12 +233,19 @@ export default async function plugin(bb: BbPluginApi) {
       if (resolvedProjectId === null) {
         throw new Error("No project available to run the enhancement in");
       }
+      const override =
+        (await bb.storage.kv.get<ModelOverride>(OVERRIDE_KEY)) ?? null;
       const child = await bb.sdk.threads.spawn({
         projectId: resolvedProjectId,
         environment: { type: "project-default" },
-        // Inherit the scope thread's provider when enhancing inside a thread;
-        // otherwise omit it so spawn uses the project's remembered default.
-        ...(providerId ? { providerId } : {}),
+        // An explicit override wins. Otherwise inherit the scope thread's
+        // provider (model stays at that provider's default); on the
+        // new-thread composer omit both so spawn uses the project default.
+        ...(override
+          ? { providerId: override.providerId, model: override.model }
+          : providerId
+            ? { providerId }
+            : {}),
         // Deliberately NOT parented to the scope thread: a hidden child
         // reports its completion to its parent, which would inject the
         // rewritten prompt into that thread's conversation. The rewrite
@@ -193,6 +277,46 @@ export default async function plugin(bb: BbPluginApi) {
     getEnhancement({ id }) {
       const row = byId.get(id) as EnhancementRow | undefined;
       return { enhancement: row ? toEnhancement(row) : null };
+    },
+    async listModels() {
+      return loadModelCatalog();
+    },
+    async getModelOverride() {
+      const override =
+        (await bb.storage.kv.get<ModelOverride>(OVERRIDE_KEY)) ?? null;
+      return { override };
+    },
+    async setModelOverride({ override }) {
+      if (override === null) {
+        await bb.storage.kv.delete(OVERRIDE_KEY);
+        return {};
+      }
+      let catalog: ModelCatalog | null = null;
+      try {
+        catalog = await loadModelCatalog();
+      } catch (error) {
+        // A catalog hiccup must not block the user's choice; an invalid pair
+        // surfaces later as a clear enhancement error from spawn.
+        bb.log.warn(
+          `model catalog unavailable while setting override: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      if (catalog !== null) {
+        const known = catalog.providers.some(
+          (provider) =>
+            provider.id === override.providerId &&
+            provider.models.some((model) => model.model === override.model),
+        );
+        if (!known) {
+          throw new Error(
+            `Model ${override.model} is not available for provider ${override.providerId}`,
+          );
+        }
+      }
+      await bb.storage.kv.set(OVERRIDE_KEY, override);
+      return {};
     },
   });
 
