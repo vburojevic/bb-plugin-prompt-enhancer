@@ -15,6 +15,7 @@
 // shared by every composer instance (a per-instance fetch would turn every
 // composer mount into a round trip).
 import {
+  Fragment,
   useEffect,
   useRef,
   useState,
@@ -72,16 +73,38 @@ interface EnhanceSignal {
   /** Present on "progress": the child thread's partial output so far. */
   text?: string;
 }
+type ReasoningLevel =
+  | "none"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "ultracode"
+  | "max"
+  | "ultra";
 interface ModelOverride {
   providerId: string;
   model: string;
+  reasoningLevel?: ReasoningLevel | null;
+}
+interface CatalogModel {
+  model: string;
+  displayName: string;
+  isDefault: boolean;
+  reasoningLevels: ReasoningLevel[];
+  defaultReasoningLevel: ReasoningLevel | null;
 }
 interface ModelCatalog {
   providers: {
     id: string;
     displayName: string;
-    models: { model: string; displayName: string; isDefault: boolean }[];
+    models: CatalogModel[];
   }[];
+}
+/** Title-case a reasoning level for display ("xhigh" → "XHigh"). */
+function levelLabel(level: ReasoningLevel): string {
+  if (level === "xhigh") return "XHigh";
+  return level.charAt(0).toUpperCase() + level.slice(1);
 }
 type Rpc = ReturnType<typeof useRpc<typeof rpcContract>>;
 type ComposerScope = ReturnType<typeof useComposerView>["scope"];
@@ -352,9 +375,11 @@ function EnhanceButton() {
     const model = provider?.models.find(
       (entry) => entry.model === picker.override?.model,
     );
+    const level = picker.override.reasoningLevel;
+    const suffix = level ? ` · ${levelLabel(level)}` : "";
     return model === undefined || provider === undefined
-      ? picker.override.model
-      : `${provider.displayName} · ${model.displayName}`;
+      ? `${picker.override.model}${suffix}`
+      : `${provider.displayName} · ${model.displayName}${suffix}`;
   })();
 
   function stopTimers(): void {
@@ -754,7 +779,9 @@ function EnhanceButton() {
       toast.success(
         next === null
           ? "Enhancer uses the thread's provider default"
-          : `Enhancer model: ${next.model}`,
+          : `Enhancer model: ${next.model}${
+              next.reasoningLevel ? ` · ${levelLabel(next.reasoningLevel)}` : ""
+            }`,
       );
     } catch (error) {
       toast.error(
@@ -857,34 +884,89 @@ function EnhanceButton() {
                       picker.override !== null &&
                       picker.override.providerId === provider.id &&
                       picker.override.model === model.model;
+                    // Reasoning levels expand under the selected model —
+                    // same progressive disclosure as bb's own composer
+                    // picker, so the list stays scannable.
+                    const showLevels = selected && model.reasoningLevels.length > 1;
                     return (
-                      <CommandItem
-                        key={`${provider.id}:${model.model}`}
-                        value={`${provider.id}:${model.model}`}
-                        keywords={[
-                          provider.displayName,
-                          model.displayName,
-                          model.model,
-                        ]}
-                        onSelect={() =>
-                          void selectOverride({
-                            providerId: provider.id,
-                            model: model.model,
-                          })
-                        }
-                      >
-                        <Icon
-                          name="Check"
-                          className={selected ? undefined : "invisible"}
-                          aria-hidden
-                        />
-                        <span className="truncate">{model.displayName}</span>
-                        {model.isDefault ? (
-                          <span className="ml-auto shrink-0 text-xs text-muted-foreground">
-                            default
-                          </span>
-                        ) : null}
-                      </CommandItem>
+                      <Fragment key={`${provider.id}:${model.model}`}>
+                        <CommandItem
+                          value={`${provider.id}:${model.model}`}
+                          keywords={[
+                            provider.displayName,
+                            model.displayName,
+                            model.model,
+                          ]}
+                          onSelect={() =>
+                            void selectOverride({
+                              providerId: provider.id,
+                              model: model.model,
+                              // Keep the level when re-picking the same
+                              // model; a different model starts at default.
+                              reasoningLevel: selected
+                                ? (picker.override?.reasoningLevel ?? null)
+                                : null,
+                            })
+                          }
+                        >
+                          <Icon
+                            name="Check"
+                            className={selected ? undefined : "invisible"}
+                            aria-hidden
+                          />
+                          <span className="truncate">{model.displayName}</span>
+                          {model.isDefault ? (
+                            <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+                              default
+                            </span>
+                          ) : null}
+                        </CommandItem>
+                        {showLevels
+                          ? model.reasoningLevels.map((level) => {
+                              const levelSelected =
+                                (picker.override?.reasoningLevel ?? null) ===
+                                  level ||
+                                (picker.override?.reasoningLevel == null &&
+                                  model.defaultReasoningLevel === level);
+                              return (
+                                <CommandItem
+                                  key={`${provider.id}:${model.model}:${level}`}
+                                  value={`${provider.id}:${model.model}:${level}`}
+                                  keywords={[
+                                    model.displayName,
+                                    "thinking",
+                                    "reasoning",
+                                    "effort",
+                                    level,
+                                  ]}
+                                  onSelect={() =>
+                                    void selectOverride({
+                                      providerId: provider.id,
+                                      model: model.model,
+                                      reasoningLevel: level,
+                                    })
+                                  }
+                                >
+                                  <Icon
+                                    name="Check"
+                                    className={
+                                      levelSelected ? undefined : "invisible"
+                                    }
+                                    aria-hidden
+                                  />
+                                  <span className="truncate pl-4 text-xs text-muted-foreground">
+                                    {levelLabel(level)}
+                                  </span>
+                                  {model.defaultReasoningLevel === level ? (
+                                    <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+                                      default
+                                    </span>
+                                  ) : null}
+                                </CommandItem>
+                              );
+                            })
+                          : null}
+                      </Fragment>
                     );
                   })}
                 </CommandGroup>

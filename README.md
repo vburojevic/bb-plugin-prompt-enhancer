@@ -9,7 +9,9 @@ is the AI.
 
 The ▾ chevron next to the action opens the enhancer model picker: pin an
 explicit provider+model for the rewrite, or leave it on "Provider default"
-to inherit. The chevron's tooltip shows the pinned model, if any.
+to inherit. Selecting a model expands its reasoning levels (Low, Medium,
+High, …) underneath, the same progressive disclosure bb's own composer
+picker uses; the chevron tooltip shows the pinned model and level.
 
 While a rewrite runs, the spark doubles as a cancel button (hover shows ✕).
 After a rewrite lands, the success toast offers **Undo** to restore the
@@ -20,8 +22,10 @@ instant text swap under `prefers-reduced-motion`.
 More:
 
 - **⌘E / Ctrl+E** enhances from the keyboard when the composer is focused.
-- The picker's **Style** group picks the rewrite shape: Tighten (default),
-  Expand into spec, Add acceptance criteria, Translate to English.
+- The rewriter picks the shape itself: a one-line ask stays one line, while
+  genuinely multi-part work becomes a brief with a "Done when:" list.
+- Runs survive switching threads mid-enhancement, and the timeout adapts to
+  each model's measured latency instead of a flat 90s.
 - Follow-up drafts in a thread include the thread title and the tail of the
   last assistant message as context, so "that bug" resolves to the actual bug.
 - The rewriter is told how many attachments the draft carries so it never

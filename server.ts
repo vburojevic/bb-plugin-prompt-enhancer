@@ -59,9 +59,23 @@ const enhancementSchema = z.object({
 });
 type Enhancement = z.infer<typeof enhancementSchema>;
 
+/** bb's reasoning levels, as accepted by threads.spawn. */
+const reasoningLevelSchema = z.enum([
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "ultracode",
+  "max",
+  "ultra",
+]);
+
 const modelOverrideSchema = z.object({
   providerId: z.string().min(1),
   model: z.string().min(1),
+  /** Absent means the model's own default reasoning level. */
+  reasoningLevel: reasoningLevelSchema.nullish(),
 });
 type ModelOverride = z.infer<typeof modelOverrideSchema>;
 
@@ -84,6 +98,9 @@ const modelCatalogSchema = z.object({
           model: z.string(),
           displayName: z.string(),
           isDefault: z.boolean(),
+          /** Reasoning levels this model supports, in bb's own order. */
+          reasoningLevels: z.array(reasoningLevelSchema),
+          defaultReasoningLevel: reasoningLevelSchema.nullable(),
         }),
       ),
     }),
@@ -334,7 +351,30 @@ export default async function plugin(bb: BbPluginApi) {
             finalize(row, text);
           } else if (child.status === "error") {
             stopProgress(id);
-            fail(id, "The enhancement thread failed");
+            // The child's own error (rate limit, out of credits, provider
+            // failure) is what the user needs to see — a generic "failed"
+            // sends them digging through a thread that is about to be
+            // deleted. thread.failed carries the same text as a fallback.
+            let message = "The enhancement thread failed";
+            try {
+              const events = await bb.sdk.threads.events.list({
+                threadId: childThreadId,
+              });
+              const lastError = [...events]
+                .reverse()
+                .find((event) => event.type.includes("error"));
+              const detail =
+                lastError === undefined
+                  ? null
+                  : ((lastError.data as { message?: string; text?: string })
+                      .message ??
+                    (lastError.data as { text?: string }).text ??
+                    null);
+              if (detail) message = detail;
+            } catch {
+              // Keep the generic message.
+            }
+            fail(id, message);
             cleanupChildThread(childThreadId);
           }
         } catch {
@@ -365,7 +405,9 @@ export default async function plugin(bb: BbPluginApi) {
       // allSettled + per-call timeout: one hung or broken provider must not
       // sink the whole catalog (or block a handler awaiting this fetch).
       const settled = await Promise.allSettled(
-        available.map(async (provider) => {
+        available.map(async (
+          provider,
+        ): Promise<ModelCatalog["providers"][number]> => {
           const result = await withTimeout(
             bb.sdk.providers.models({ providerId: provider.id }),
             PROVIDER_CALL_TIMEOUT_MS,
@@ -378,6 +420,10 @@ export default async function plugin(bb: BbPluginApi) {
               model: model.model,
               displayName: model.displayName,
               isDefault: model.isDefault,
+              reasoningLevels: model.supportedReasoningEfforts.map(
+                (entry) => entry.reasoningEffort,
+              ),
+              defaultReasoningLevel: model.defaultReasoningEffort ?? null,
             })),
           };
         }),
@@ -501,7 +547,14 @@ export default async function plugin(bb: BbPluginApi) {
         // provider (model stays at that provider's default); on the
         // new-thread composer omit both so spawn uses the project default.
         ...(override
-          ? { providerId: override.providerId, model: override.model }
+          ? {
+              providerId: override.providerId,
+              model: override.model,
+              // Omitted → the model's own default reasoning level.
+              ...(override.reasoningLevel
+                ? { reasoningLevel: override.reasoningLevel }
+                : {}),
+            }
           : providerId
             ? { providerId }
             : {}),
@@ -549,7 +602,11 @@ export default async function plugin(bb: BbPluginApi) {
         const override =
           (await bb.storage.kv.get<ModelOverride>(OVERRIDE_KEY)) ?? null;
         if (override !== null) {
-          modelKey = `${override.providerId}:${override.model}`;
+          // Reasoning level changes latency materially, so it belongs in the
+          // key the adaptive timeout learns from.
+          modelKey = `${override.providerId}:${override.model}:${
+            override.reasoningLevel ?? "default"
+          }`;
         } else if (threadId !== null) {
           const parent = await bb.sdk.threads.get({ threadId });
           if (parent.providerId) modelKey = `inherit:${parent.providerId}`;
@@ -600,14 +657,20 @@ export default async function plugin(bb: BbPluginApi) {
         void refreshCatalog().catch(() => {});
       }
       if (catalog !== null) {
-        const known = catalog.providers.some(
-          (provider) =>
-            provider.id === override.providerId &&
-            provider.models.some((model) => model.model === override.model),
-        );
-        if (!known) {
+        const model = catalog.providers
+          .find((provider) => provider.id === override.providerId)
+          ?.models.find((entry) => entry.model === override.model);
+        if (model === undefined) {
           throw new Error(
             `Model ${override.model} is not available for provider ${override.providerId}`,
+          );
+        }
+        if (
+          override.reasoningLevel &&
+          !model.reasoningLevels.includes(override.reasoningLevel)
+        ) {
+          throw new Error(
+            `${model.displayName} does not support the ${override.reasoningLevel} reasoning level`,
           );
         }
       }
