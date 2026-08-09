@@ -1,10 +1,10 @@
 // bb-plugin-prompt-enhancer — frontend entry.
 //
-// Adds an "Enhance prompt" action to every composer: the main button rewrites
-// the draft via the backend (a hidden bb thread), the chevron opens a dropdown
-// to pin an explicit provider+model for the enhancement (default: inherit the
-// current thread's provider, or the project default on the new-thread
-// composer). Styling uses host token classes only.
+// Adds a unified "Enhance prompt" control to every composer: the zap half
+// rewrites the draft via the backend (a hidden bb thread), the chevron half
+// opens a dropdown to pin an explicit provider+model for the enhancement
+// (default: inherit the current thread's provider, or the project default on
+// the new-thread composer). Styling uses host token classes only.
 import { useEffect, useRef, useState } from "react";
 import {
   definePluginApp,
@@ -15,8 +15,8 @@ import {
 } from "@bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { rpcContract } from "./server";
-import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
+import { cn } from "@/lib/utils";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -44,6 +44,16 @@ type ModelCatalog = {
     models: { model: string; displayName: string; isDefault: boolean }[];
   }[];
 };
+
+/** One half of the split control — chrome comes from the group wrapper. */
+function groupHalfClass(extra?: string): string {
+  return cn(
+    "flex h-7 items-center justify-center text-muted-foreground transition-colors",
+    "hover:bg-state-hover hover:text-foreground",
+    "disabled:pointer-events-none disabled:opacity-50",
+    extra,
+  );
+}
 
 function EnhanceButton() {
   const composer = useComposer();
@@ -118,13 +128,23 @@ function EnhanceButton() {
   async function enhance(): Promise<void> {
     const text = composer.text.trim();
     if (!text || disabled) return;
+    // Every composer flavor that knows its thread hands it over so the
+    // enhancement inherits that thread's provider; only the new-thread
+    // composer falls back to the project default.
+    const scope = view.scope;
+    const scopeThreadId =
+      scope.kind === "thread" || scope.kind === "queued-message"
+        ? scope.threadId
+        : scope.kind === "side-chat"
+          ? (scope.childThreadId ?? scope.parentThreadId)
+          : null;
+    const scopeProjectId = scope.kind === "new-thread" ? scope.projectId : null;
     let id: string;
     try {
       ({ id } = await rpc.call("startEnhance", {
         text,
-        threadId: view.scope.kind === "thread" ? view.scope.threadId : null,
-        projectId:
-          view.scope.kind === "new-thread" ? view.scope.projectId : null,
+        threadId: scopeThreadId,
+        projectId: scopeProjectId,
       }));
     } catch (error) {
       toast.error(
@@ -174,12 +194,14 @@ function EnhanceButton() {
   }
 
   return (
-    <div className="flex items-center">
-      <Button
+    <div
+      role="group"
+      aria-label="Prompt enhancer"
+      className="flex items-center overflow-hidden rounded-md border border-input"
+    >
+      <button
         type="button"
-        variant="ghost"
-        size="icon"
-        className="size-7 rounded-r-none text-muted-foreground"
+        className={groupHalfClass("w-7")}
         disabled={disabled}
         onClick={() => void enhance()}
         aria-label="Enhance prompt"
@@ -191,26 +213,25 @@ function EnhanceButton() {
       >
         <Icon
           name={busy ? "Loading" : "Zap"}
-          className={busy ? "animate-spin" : undefined}
+          className={cn("size-4", busy && "animate-spin")}
           aria-hidden
         />
-      </Button>
+      </button>
+      <div className="h-4 w-px bg-border" aria-hidden />
       <DropdownMenu
         onOpenChange={(open) => {
           if (open && !menuLoaded) void loadMenu();
         }}
       >
         <DropdownMenuTrigger asChild>
-          <Button
+          <button
             type="button"
-            variant="ghost"
-            size="icon"
-            className="size-7 w-5 rounded-l-none text-muted-foreground"
+            className={groupHalfClass("w-5")}
             aria-label="Choose enhancer model"
             title="Choose enhancer model"
           >
-            <Icon name="ChevronDown" aria-hidden />
-          </Button>
+            <Icon name="ChevronDown" className="size-3.5" aria-hidden />
+          </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="w-64">
           <DropdownMenuLabel>Enhancer model</DropdownMenuLabel>
@@ -249,8 +270,10 @@ function EnhanceButton() {
                         className={selected ? undefined : "invisible"}
                         aria-hidden
                       />
-                      {model.displayName}
-                      {model.isDefault ? " (default)" : ""}
+                      <span className="truncate">
+                        {model.displayName}
+                        {model.isDefault ? " (default)" : ""}
+                      </span>
                     </DropdownMenuItem>
                   );
                 })}

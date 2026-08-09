@@ -146,6 +146,10 @@ export default async function plugin(bb: BbPluginApi) {
     `INSERT INTO enhancements (id, scope_thread_id, original_text, status, created_at)
      VALUES (?, ?, ?, 'pending', ?)`,
   );
+  // History is diagnostic, not archival — keep the table bounded.
+  db.prepare(`DELETE FROM enhancements WHERE created_at < ?`).run(
+    Date.now() - 7 * 24 * 60 * 60 * 1000,
+  );
   const setChildThread = db.prepare(
     `UPDATE enhancements SET child_thread_id = ? WHERE id = ?`,
   );
@@ -169,47 +173,61 @@ export default async function plugin(bb: BbPluginApi) {
     publish(id, "error");
   }
 
-  // Provider/model catalog, cached briefly so repeated menu opens stay fast.
+  // Provider/model catalog. Menu opens always answer from cache; a stale
+  // cache is served immediately and refreshed in the background
+  // (stale-while-revalidate), and concurrent loads share one fetch.
   let catalogCache: { at: number; catalog: ModelCatalog } | null = null;
+  let catalogInflight: Promise<ModelCatalog> | null = null;
+
+  function refreshCatalog(): Promise<ModelCatalog> {
+    catalogInflight ??= (async () => {
+      const available = (await bb.sdk.providers.list({})).filter(
+        (provider) => provider.available,
+      );
+      const catalog: ModelCatalog = {
+        providers: (
+          await Promise.all(
+            available.map(async (provider) => {
+              const result = await bb.sdk.providers.models({
+                providerId: provider.id,
+              });
+              return {
+                id: provider.id,
+                displayName: provider.displayName,
+                models: result.models.map((model) => ({
+                  model: model.model,
+                  displayName: model.displayName,
+                  isDefault: model.isDefault,
+                })),
+              };
+            }),
+          )
+          // Providers with an empty catalog (e.g. no curated models) would
+          // render as a bare group heading in the dropdown.
+        ).filter((provider) => provider.models.length > 0),
+      };
+      catalogCache = { at: Date.now(), catalog };
+      return catalog;
+    })().finally(() => {
+      catalogInflight = null;
+    });
+    return catalogInflight;
+  }
 
   async function loadModelCatalog(): Promise<ModelCatalog> {
-    if (catalogCache && Date.now() - catalogCache.at < CATALOG_TTL_MS) {
+    if (catalogCache !== null) {
+      if (Date.now() - catalogCache.at >= CATALOG_TTL_MS) {
+        // Detached refresh; a failure only means the next open retries.
+        void refreshCatalog().catch(() => {});
+      }
       return catalogCache.catalog;
     }
-    const available = (await bb.sdk.providers.list({})).filter(
-      (provider) => provider.available,
-    );
-    const catalog: ModelCatalog = {
-      providers: (
-        await Promise.all(
-          available.map(async (provider) => {
-            const result = await bb.sdk.providers.models({
-              providerId: provider.id,
-            });
-            return {
-              id: provider.id,
-              displayName: provider.displayName,
-              models: result.models.map((model) => ({
-                model: model.model,
-                displayName: model.displayName,
-                isDefault: model.isDefault,
-              })),
-            };
-          }),
-        )
-        // Providers with an empty catalog (e.g. no curated models) would
-        // render as a bare group heading in the dropdown.
-      ).filter((provider) => provider.models.length > 0),
-    };
-    catalogCache = { at: Date.now(), catalog };
-    return catalog;
+    return refreshCatalog();
   }
 
   // Pre-warm the catalog so the first dropdown open doesn't wait on provider
   // discovery. Detached: must never reject into the host.
-  void loadModelCatalog().catch(() => {
-    // A cold catalog only means the first menu open fetches it instead.
-  });
+  void refreshCatalog().catch(() => {});
 
   /**
    * Detached kickoff. It MUST swallow every error itself: a stale bb handle or
