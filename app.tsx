@@ -53,20 +53,15 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import {
+  formatMissing,
+  missingReferences,
+} from "@/lib/references";
+import { nextShown, REVEAL_TICK_MS } from "@/lib/reveal";
 
 const TIMEOUT_MS = 90_000;
 const isMac = navigator.platform.toUpperCase().includes("MAC");
 const SHORTCUT_HINT = isMac ? "⌘E" : "Ctrl+E";
-
-// Reveal engine. One adaptive typewriter for every arrival pattern: text can
-// land as one block (the SDK only surfaces *completed* messages) or in
-// chunks, and either way it flows in smoothly — each tick reveals a fraction
-// of what remains, so big arrivals accelerate and the tail eases out.
-const REVEAL_TICK_MS = 24;
-/** Fraction of the remaining text revealed per tick (ease-out catch-up). */
-const REVEAL_CATCH_UP = 0.1;
-/** Minimum characters per tick so the tail never crawls. */
-const REVEAL_MIN_STEP = 2;
 /** One-shot settle sweep duration; keep in sync with the CSS animation. */
 const SETTLE_MS = 950;
 
@@ -88,33 +83,6 @@ interface ModelCatalog {
   }[];
 }
 type Rpc = ReturnType<typeof useRpc<typeof rpcContract>>;
-
-/**
- * Live references the rewriter is told to preserve verbatim: @mentions,
- * URLs, inline code spans, and anything path-shaped. Used to warn when a
- * rewrite drops one — the model promises, this verifies.
- */
-function extractReferences(text: string): string[] {
-  const out = new Set<string>();
-  for (const match of text.match(/https?:\/\/[^\s)"']+/g) ?? []) out.add(match);
-  for (const match of text.match(/(?:^|\s)@[\w./-]{2,}/g) ?? [])
-    out.add(match.trim());
-  for (const match of text.match(/`[^`\n]+`/g) ?? [])
-    out.add(match.slice(1, -1));
-  for (const match of text.match(/[\w.-]+\/[\w./-]+/g) ?? []) out.add(match);
-  return [...out].filter((token) => token.length > 2);
-}
-
-function missingReferences(original: string, enhanced: string): string[] {
-  return extractReferences(original).filter(
-    (token) => !enhanced.includes(token),
-  );
-}
-
-function formatMissing(missing: string[]): string {
-  const shown = missing.slice(0, 3).join(", ");
-  return missing.length > 3 ? `${shown}, …` : shown;
-}
 
 // ---------------------------------------------------------------------------
 // Shared catalog/selection store (per window)
@@ -476,12 +444,7 @@ function EnhanceButton() {
       if (current === null) return;
       try {
         if (current.shown < current.target.length) {
-          const remaining = current.target.length - current.shown;
-          current.shown = Math.min(
-            current.target.length,
-            current.shown +
-              Math.max(REVEAL_MIN_STEP, Math.ceil(remaining * REVEAL_CATCH_UP)),
-          );
+          current.shown = nextShown(current.shown, current.target.length);
           composer.setText(current.target.slice(0, current.shown));
         }
         if (current.done && current.shown >= current.target.length) {

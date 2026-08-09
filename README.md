@@ -89,6 +89,16 @@ bb plugin config prompt-enhancer
 bb plugin config prompt-enhancer set greeting hi
 ```
 
+## Tests
+
+The pure logic lives in `lib/` (prompt construction, the dropped-reference
+guard, reveal pacing) and is covered by unit tests in `tests/` running on
+Node's built-in test runner:
+
+```
+npm test
+```
+
 ## Types & API reference
 
 `types/bb-plugin-sdk.d.ts` (and `types/bb-plugin-sdk-app.d.ts` for the
