@@ -45,6 +45,26 @@ test("nothing missing when everything survives", () => {
   assert.deepEqual(missingReferences(text, `Rewritten: ${text}`), []);
 });
 
+test("known mention labels are verified exactly, not heuristically", () => {
+  const original = "summarize @meeting notes and clean up the doc";
+  const enhanced = "Summarize the meeting notes and clean up the document.";
+  // Regex alone finds "@meeting"; the structured label is ground truth.
+  assert.deepEqual(
+    missingReferences(original, enhanced, ["@meeting notes"]),
+    ["@meeting", "@meeting notes"],
+  );
+  const preserved = "Summarize @meeting notes and clean up the document.";
+  assert.deepEqual(
+    missingReferences(original, preserved, ["@meeting notes"]),
+    [],
+  );
+});
+
+test("known tokens absent from the original are ignored", () => {
+  // A stale label from a previous draft must not produce a false warning.
+  assert.deepEqual(missingReferences("do the thing", "Do it.", ["@stale"]), []);
+});
+
 test("formatMissing lists up to three then elides", () => {
   assert.equal(formatMissing(["a/b", "c/d"]), "a/b, c/d");
   assert.equal(

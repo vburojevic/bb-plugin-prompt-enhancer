@@ -59,11 +59,12 @@ import {
 } from "@/lib/references";
 import { nextShown, REVEAL_TICK_MS } from "@/lib/reveal";
 
-const TIMEOUT_MS = 90_000;
 const isMac = navigator.platform.toUpperCase().includes("MAC");
 const SHORTCUT_HINT = isMac ? "⌘E" : "Ctrl+E";
 /** One-shot settle sweep duration; keep in sync with the CSS animation. */
 const SETTLE_MS = 950;
+/** Timeout used if startEnhance somehow returns without one. */
+const FALLBACK_TIMEOUT_MS = 90_000;
 
 interface EnhanceSignal {
   id?: string;
@@ -83,6 +84,45 @@ interface ModelCatalog {
   }[];
 }
 type Rpc = ReturnType<typeof useRpc<typeof rpcContract>>;
+type ComposerScope = ReturnType<typeof useComposerView>["scope"];
+
+/** One key per composer draft, shared by every state map below. */
+function scopeKey(scope: ComposerScope): string {
+  if (scope.kind === "thread" || scope.kind === "queued-message")
+    return scope.threadId;
+  if (scope.kind === "side-chat")
+    return scope.childThreadId ?? scope.parentThreadId;
+  if (scope.kind === "new-thread") return `new:${scope.projectId ?? ""}`;
+  // Exhaustive today; future scope kinds fall back to their kind tag.
+  return (scope as { kind: string }).kind;
+}
+
+// ---------------------------------------------------------------------------
+// Module state that must survive unmounts and scope switches (per window)
+// ---------------------------------------------------------------------------
+
+/**
+ * In-flight enhancement per composer scope. Lives at module level so
+ * switching threads mid-run doesn't lose the enhancement: the server keeps
+ * working, and when a composer for this scope mounts again it resumes from
+ * here (re-locks, re-arms the deadline, and picks up the finished result).
+ */
+interface PendingRun {
+  id: string;
+  originalText: string;
+  previewGate: boolean;
+  /** Absolute time after which this run counts as timed out. */
+  deadline: number;
+  /** Structured @-mention labels captured from the draft at start. */
+  mentionLabels: readonly string[];
+}
+const pendingRuns = new Map<string, PendingRun>();
+
+/**
+ * Latest structured @-mention labels per scope, from the composer's
+ * richText observer — ground truth for the dropped-reference guard.
+ */
+const mentionLabelsByScope = new Map<string, readonly string[]>();
 
 // ---------------------------------------------------------------------------
 // Shared catalog/selection store (per window)
@@ -260,6 +300,8 @@ function EnhanceButton() {
   const originalTextRef = useRef<string>("");
   /** Whether the pending enhancement should preview instead of auto-apply. */
   const previewGateRef = useRef(false);
+  /** Structured mention labels snapshotted when the pending run started. */
+  const mentionLabelsRef = useRef<readonly string[]>([]);
   /** Live reveal state; null when no reveal is running. */
   const revealRef = useRef<{
     target: string;
@@ -273,6 +315,7 @@ function EnhanceButton() {
 
   const [pickerOpen, setPickerOpen] = useState(false);
   const picker = usePickerState();
+  const myScopeKey = scopeKey(view.scope);
 
   // Eagerly warm the shared store so the tooltip and check marks reflect the
   // remembered selection without opening the picker first.
@@ -315,6 +358,7 @@ function EnhanceButton() {
 
   function clearPending(): void {
     stopTimers();
+    pendingRuns.delete(myScopeKey);
     pendingIdRef.current = null;
     setBusy(false);
     setCancelHover(false);
@@ -357,7 +401,8 @@ function EnhanceButton() {
       },
     });
     // The prompt tells the model to preserve live references; this verifies.
-    const missing = missingReferences(original, enhanced);
+    // Structured mention labels are ground truth, regex covers the rest.
+    const missing = missingReferences(original, enhanced, mentionLabelsRef.current);
     if (missing.length > 0) {
       toast.warning(
         `The rewrite may have dropped: ${formatMissing(missing)} — check before sending.`,
@@ -463,10 +508,42 @@ function EnhanceButton() {
     }, REVEAL_TICK_MS);
   }
 
+  /** The run for this scope finished successfully: preview or reveal. */
+  function resolveDone(enhanced: string): void {
+    pendingRuns.delete(myScopeKey);
+    if (previewGateRef.current) {
+      // Review mode: release the composer untouched and let the user
+      // decide in the preview dialog.
+      clearPending();
+      setPreview({ original: originalTextRef.current, enhanced });
+      return;
+    }
+    // The engine finishes typing whatever remains, then settles.
+    feedReveal(enhanced, true);
+  }
+
+  function armTimeout(id: string, ms: number): void {
+    timeoutRef.current = setTimeout(() => {
+      if (pendingIdRef.current === id) {
+        // Tell the backend too so the hidden thread is stopped and reaped,
+        // not left running toward a result nobody will read.
+        void rpc.call("cancelEnhance", { id }).catch(() => {});
+        abortReveal();
+        clearPending();
+        toast.error("Enhancement timed out");
+      }
+    }, ms);
+  }
+
   useRealtime("prompt-enhancer", (payload) => {
     const signal = payload as EnhanceSignal;
-    const pendingId = pendingIdRef.current;
-    if (pendingId === null || signal.id !== pendingId) return;
+    const run = pendingRuns.get(myScopeKey);
+    if (
+      run === undefined ||
+      signal.id !== run.id ||
+      pendingIdRef.current !== run.id
+    )
+      return;
     if (signal.status === "progress") {
       // Genuine partial output from the child thread. Preview mode keeps the
       // draft untouched until the user applies, so live paint is skipped.
@@ -477,21 +554,10 @@ function EnhanceButton() {
     void (async () => {
       try {
         const { enhancement } = await rpc.call("getEnhancement", {
-          id: pendingId,
+          id: run.id,
         });
         if (enhancement?.status === "done" && enhancement.enhanced) {
-          if (previewGateRef.current) {
-            // Review mode: release the composer untouched and let the user
-            // decide in the preview dialog.
-            clearPending();
-            setPreview({
-              original: originalTextRef.current,
-              enhanced: enhancement.enhanced,
-            });
-            return;
-          }
-          // The engine finishes typing whatever remains, then settles.
-          feedReveal(enhancement.enhanced, true);
+          resolveDone(enhancement.enhanced);
           return;
         } else if (enhancement?.status === "error") {
           toast.error(enhancement.error ?? "Enhancement failed");
@@ -506,6 +572,52 @@ function EnhanceButton() {
       clearPending();
     })();
   });
+
+  // Resume an in-flight run when a composer for this scope (re)mounts —
+  // switching threads mid-enhancement must not lose the work. Re-locks,
+  // re-arms the remaining deadline, and catches up on a completion that
+  // happened while no composer for this scope was mounted.
+  useEffect(() => {
+    const run = pendingRuns.get(myScopeKey);
+    if (run === undefined) return () => stopTimers();
+    pendingIdRef.current = run.id;
+    previewGateRef.current = run.previewGate;
+    originalTextRef.current = run.originalText;
+    mentionLabelsRef.current = run.mentionLabels;
+    revealRef.current = null;
+    setBusy(true);
+    composer.setInputLock(true);
+    composer.setTextEffect({ className: "prompt-enhancer-draft" });
+    const remaining = run.deadline - Date.now();
+    if (remaining <= 0) {
+      void rpc.call("cancelEnhance", { id: run.id }).catch(() => {});
+      clearPending();
+      toast.error("Enhancement timed out");
+      return () => stopTimers();
+    }
+    armTimeout(run.id, remaining);
+    void (async () => {
+      try {
+        const { enhancement } = await rpc.call("getEnhancement", {
+          id: run.id,
+        });
+        if (pendingIdRef.current !== run.id) return;
+        if (enhancement?.status === "done" && enhancement.enhanced) {
+          resolveDone(enhancement.enhanced);
+        } else if (enhancement?.status === "error") {
+          toast.error(enhancement.error ?? "Enhancement failed");
+          clearPending();
+        } else if (enhancement?.status === "cancelled") {
+          clearPending();
+        }
+        // Still pending: realtime signals and the timeout take it from here.
+      } catch {
+        // Realtime signals and the timeout still cover this run.
+      }
+    })();
+    return () => stopTimers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [myScopeKey]);
 
   async function enhance(): Promise<void> {
     const text = composer.text.trim();
@@ -528,8 +640,9 @@ function EnhanceButton() {
       .then((prefs) => prefs.previewBeforeApply)
       .catch(() => false);
     let id: string;
+    let timeoutMs = FALLBACK_TIMEOUT_MS;
     try {
-      ({ id } = await rpc.call("startEnhance", {
+      ({ id, timeoutMs } = await rpc.call("startEnhance", {
         text,
         threadId: scopeThreadId,
         projectId: scopeProjectId,
@@ -541,22 +654,22 @@ function EnhanceButton() {
       );
       return;
     }
+    const mentionLabels = mentionLabelsByScope.get(myScopeKey) ?? [];
+    pendingRuns.set(myScopeKey, {
+      id,
+      originalText: composer.text,
+      previewGate: previewGateRef.current,
+      deadline: Date.now() + timeoutMs,
+      mentionLabels,
+    });
     pendingIdRef.current = id;
     originalTextRef.current = composer.text;
+    mentionLabelsRef.current = mentionLabels;
     revealRef.current = null;
     setBusy(true);
     composer.setInputLock(true);
     composer.setTextEffect({ className: "prompt-enhancer-draft" });
-    timeoutRef.current = setTimeout(() => {
-      if (pendingIdRef.current === id) {
-        // Tell the backend too so the hidden thread is stopped and reaped,
-        // not left running toward a result nobody will read.
-        void rpc.call("cancelEnhance", { id }).catch(() => {});
-        abortReveal();
-        clearPending();
-        toast.error("Enhancement timed out");
-      }
-    }, TIMEOUT_MS);
+    armTimeout(id, timeoutMs);
   }
 
   function cancel(): void {
@@ -822,6 +935,16 @@ export default definePluginApp((app) => {
   app.composer.customize({
     id: "prompt-enhancer",
     actions: [{ id: "enhance", component: EnhanceButton }],
+    richText: {
+      // Ground truth for the dropped-reference guard: the composer's
+      // structured @-mentions, tracked per scope as the draft changes.
+      onDraftChange(draft, view) {
+        mentionLabelsByScope.set(
+          scopeKey(view.scope),
+          draft.mentions.map((mention) => mention.label),
+        );
+      },
+    },
   });
   // Keyframes for the busy shimmer and the settle sweep. The Tailwind pass
   // cannot emit raw keyframes, so a content script injects them and cleans

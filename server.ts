@@ -14,6 +14,7 @@
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 import { buildEnhancePrompt } from "./lib/enhance-prompt";
+import { adaptiveTimeoutMs } from "./lib/adaptive-timeout";
 
 const REALTIME_CHANNEL = "prompt-enhancer";
 const OVERRIDE_KEY = "model-override";
@@ -66,8 +67,9 @@ type ModelOverride = z.infer<typeof modelOverrideSchema>;
 
 /** How often the child thread's partial output is polled while pending. */
 const PROGRESS_POLL_MS = 400;
-/** Progress polling stops unconditionally after this long. */
-const PROGRESS_MAX_MS = 100_000;
+/** Progress polling stops unconditionally after this long (outlives the
+ * largest adaptive timeout so a slow run keeps painting to the end). */
+const PROGRESS_MAX_MS = 190_000;
 
 /** Tail of the scope thread's last output shown to the rewriter as context. */
 const CONTEXT_OUTPUT_CAP = 1500;
@@ -99,7 +101,7 @@ export const rpcContract = defineRpcContract({
         attachmentCount: z.number().int().min(0),
       })
       .strict(),
-    output: z.object({ id: z.string() }),
+    output: z.object({ id: z.string(), timeoutMs: z.number() }),
   },
   getEnhancement: {
     input: z.object({ id: z.string() }).strict(),
@@ -136,6 +138,8 @@ interface EnhancementRow {
   enhanced: string | null;
   error: string | null;
   created_at: number;
+  model_key: string | null;
+  duration_ms: number | null;
 }
 
 function toEnhancement(row: EnhancementRow): Enhancement {
@@ -180,11 +184,18 @@ export default async function plugin(bb: BbPluginApi) {
       error TEXT,
       created_at INTEGER NOT NULL
     )`,
+    `ALTER TABLE enhancements ADD COLUMN model_key TEXT`,
+    `ALTER TABLE enhancements ADD COLUMN duration_ms INTEGER`,
   ]);
 
   const insertPending = db.prepare(
-    `INSERT INTO enhancements (id, scope_thread_id, original_text, status, created_at)
-     VALUES (?, ?, ?, 'pending', ?)`,
+    `INSERT INTO enhancements (id, scope_thread_id, original_text, status, model_key, created_at)
+     VALUES (?, ?, ?, 'pending', ?, ?)`,
+  );
+  const recentDurations = db.prepare(
+    `SELECT duration_ms FROM enhancements
+     WHERE model_key = ? AND duration_ms IS NOT NULL
+     ORDER BY created_at DESC LIMIT 12`,
   );
   // History is diagnostic, not archival — keep the table bounded.
   db.prepare(`DELETE FROM enhancements WHERE created_at < ?`).run(
@@ -203,7 +214,7 @@ export default async function plugin(bb: BbPluginApi) {
     `SELECT * FROM enhancements WHERE child_thread_id = ? AND status = 'pending'`,
   );
   const markDone = db.prepare(
-    `UPDATE enhancements SET status = 'done', enhanced = ? WHERE id = ? AND status = 'pending'`,
+    `UPDATE enhancements SET status = 'done', enhanced = ?, duration_ms = ? WHERE id = ? AND status = 'pending'`,
   );
   const markError = db.prepare(
     `UPDATE enhancements SET status = 'error', error = ? WHERE id = ? AND status = 'pending'`,
@@ -492,12 +503,31 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.rpc.register(rpcContract, {
-    startEnhance({ text, threadId, projectId, attachmentCount }) {
+    async startEnhance({ text, threadId, projectId, attachmentCount }) {
       const id = crypto.randomUUID();
-      insertPending.run(id, threadId, text, Date.now());
+      // Model key drives the adaptive timeout: history for THIS model is the
+      // only meaningful predictor. All lookups are local and best-effort.
+      let modelKey = "inherit:default";
+      try {
+        const override =
+          (await bb.storage.kv.get<ModelOverride>(OVERRIDE_KEY)) ?? null;
+        if (override !== null) {
+          modelKey = `${override.providerId}:${override.model}`;
+        } else if (threadId !== null) {
+          const parent = await bb.sdk.threads.get({ threadId });
+          if (parent.providerId) modelKey = `inherit:${parent.providerId}`;
+        }
+      } catch {
+        // Fall back to the default key; the timeout just adapts less finely.
+      }
+      const durations = (recentDurations.all(modelKey) as {
+        duration_ms: number;
+      }[]).map((row) => row.duration_ms);
+      const timeoutMs = adaptiveTimeoutMs(durations);
+      insertPending.run(id, threadId, text, modelKey, Date.now());
       // NON-BLOCKING: completion arrives via thread.idle / thread.failed below.
       void runEnhance(id, text, threadId, projectId, attachmentCount);
-      return { id };
+      return { id, timeoutMs };
     },
     getEnhancement({ id }) {
       const row = byId.get(id) as EnhancementRow | undefined;
@@ -561,7 +591,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (enhanced.length === 0) {
       fail(row.id, "The enhancement thread returned an empty response");
     } else {
-      markDone.run(enhanced, row.id);
+      markDone.run(enhanced, Date.now() - row.created_at, row.id);
       publish(row.id, "done");
     }
     cleanupChildThread(thread.id);
