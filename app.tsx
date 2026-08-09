@@ -219,38 +219,53 @@ const SHIMMER_CSS = `
     transparent 75%
   );
   background-size: 250% 100%;
+  background-repeat: no-repeat;
   animation: prompt-enhancer-sweep 1.4s linear infinite;
 }
+/* Text effects use TWO gradient layers clipped to the glyphs: a moving
+   non-repeating band on top of a solid base. The solid underlay means text
+   outside the band always renders at exactly the base color — no repeated
+   ghost bands drifting through, and (for the settle) an end state identical
+   to normal text, so removing the class is invisible.
+   90deg on purpose: the band must vary along x only, so it crosses every
+   wrapped line at the same spot; a diagonal band reads as blotches. */
 .prompt-enhancer-draft {
-  /* 90deg on purpose: the gradient must vary along x only, so the bright
-     band crosses every wrapped line at the same spot. A diagonal band hits
-     each line at a different x and reads as blotches on multi-line drafts.
-     65% floor keeps the waiting draft clearly readable while it shimmers. */
-  background-image: linear-gradient(
-    90deg,
-    color-mix(in oklab, var(--foreground) 65%, transparent) 30%,
-    var(--foreground) 50%,
-    color-mix(in oklab, var(--foreground) 65%, transparent) 70%
-  );
-  background-size: 220% 100%;
+  background-image:
+    linear-gradient(
+      90deg,
+      transparent 38%,
+      var(--foreground) 50%,
+      transparent 62%
+    ),
+    linear-gradient(
+      90deg,
+      color-mix(in oklab, var(--foreground) 70%, transparent),
+      color-mix(in oklab, var(--foreground) 70%, transparent)
+    );
+  background-size: 250% 100%, 100% 100%;
+  background-repeat: no-repeat;
   background-clip: text;
   -webkit-background-clip: text;
   color: transparent;
   animation: prompt-enhancer-sweep 1.4s linear infinite;
 }
 .prompt-enhancer-settle {
-  /* 90deg for the same multi-line reason as .prompt-enhancer-draft. */
-  background-image: linear-gradient(
-    90deg,
-    var(--foreground) 32%,
-    var(--primary) 50%,
-    var(--foreground) 68%
-  );
-  background-size: 220% 100%;
+  background-image:
+    linear-gradient(
+      90deg,
+      transparent 40%,
+      var(--primary) 50%,
+      transparent 60%
+    ),
+    linear-gradient(90deg, var(--foreground), var(--foreground));
+  background-size: 250% 100%, 100% 100%;
+  background-repeat: no-repeat;
   background-clip: text;
   -webkit-background-clip: text;
   color: transparent;
-  animation: prompt-enhancer-sweep 0.9s cubic-bezier(0.16, 1, 0.3, 1) 1;
+  /* fill-mode both: holds the band offscreen at the end, so the text sits
+     at plain foreground until the class is removed — no end-of-sweep snap. */
+  animation: prompt-enhancer-sweep 0.9s cubic-bezier(0.16, 1, 0.3, 1) 1 both;
 }
 @media (prefers-reduced-motion: reduce) {
   .prompt-enhancer-pill-busy,

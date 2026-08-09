@@ -271,9 +271,26 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  /** Polls of unchanged non-empty output before it counts as the result. */
+  const PROGRESS_STABLE_POLLS = 3;
+
   function startProgress(id: string, childThreadId: string): void {
     const startedAt = Date.now();
-    let lastPublished = "";
+    let lastSeen = "";
+    let stablePolls = 0;
+
+    function finalize(row: EnhancementRow, text: string): void {
+      stopProgress(id);
+      const enhanced = text.trim();
+      if (enhanced.length === 0) {
+        fail(id, "The enhancement thread returned an empty response");
+      } else {
+        markDone.run(enhanced, Date.now() - row.created_at, id);
+        publish(id, "done");
+      }
+      cleanupChildThread(childThreadId);
+    }
+
     const timer = setInterval(() => {
       void (async () => {
         try {
@@ -290,15 +307,35 @@ export default async function plugin(bb: BbPluginApi) {
             threadId: childThreadId,
           });
           const text = output ?? "";
-          // Monotonic: only growth is relayed, so the composer never sees
-          // the text shrink or flicker between event-assembly states.
-          if (text.length > lastPublished.length) {
-            lastPublished = text;
+          if (text.length > lastSeen.length) {
+            // Monotonic: only growth is relayed, so the composer never sees
+            // the text shrink or flicker between event-assembly states.
             bb.realtime.publish(REALTIME_CHANNEL, {
               id,
               status: "progress",
               text,
             });
+          }
+          stablePolls = text.length > 0 && text === lastSeen ? stablePolls + 1 : 0;
+          lastSeen = text;
+          // Optimistic finish: output is assembled from COMPLETED messages
+          // only, so non-empty text that stays unchanged across several
+          // polls IS the rewrite — the thread just spends multiple further
+          // seconds in provider teardown before thread.idle fires, which
+          // previously left the composer locked and the pill spinning long
+          // after the full text had painted. The idle check below and the
+          // lifecycle events remain as fallbacks (all status-guarded).
+          if (stablePolls >= PROGRESS_STABLE_POLLS) {
+            finalize(row, text);
+            return;
+          }
+          const child = await bb.sdk.threads.get({ threadId: childThreadId });
+          if (child.status === "idle") {
+            finalize(row, text);
+          } else if (child.status === "error") {
+            stopProgress(id);
+            fail(id, "The enhancement thread failed");
+            cleanupChildThread(childThreadId);
           }
         } catch {
           // Stale handle or the child is gone — either way stop polling;
