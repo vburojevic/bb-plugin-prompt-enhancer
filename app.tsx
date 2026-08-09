@@ -787,21 +787,32 @@ function EnhanceButton() {
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, []);
 
+  /**
+   * Selections do NOT close the picker: model and reasoning level are one
+   * combined choice, so both can be set in a single visit (same behavior as
+   * bb's own model picker). The toast reuses one id so a run of selections
+   * updates a single toast instead of stacking.
+   */
   async function selectOverride(next: ModelOverride | null): Promise<void> {
-    setPickerOpen(false);
+    // Optimistic: the row's check moves under the finger immediately, and a
+    // failed save reverts it below.
+    const previous = picker.override;
+    setSharedOverride(next);
     try {
       await rpc.call("setModelOverride", { override: next });
-      setSharedOverride(next);
       toast.success(
         next === null
           ? "Enhancer uses the thread's provider default"
           : `Enhancer model: ${next.model}${
               next.reasoningLevel ? ` · ${levelLabel(next.reasoningLevel)}` : ""
             }`,
+        { id: "prompt-enhancer-model" },
       );
     } catch (error) {
+      setSharedOverride(previous);
       toast.error(
         error instanceof Error ? error.message : "Failed to save the model",
+        { id: "prompt-enhancer-model" },
       );
     }
   }
