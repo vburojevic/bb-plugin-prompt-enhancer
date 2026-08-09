@@ -159,10 +159,13 @@ export default async function plugin(bb: BbPluginApi) {
       const child = await bb.sdk.threads.spawn({
         projectId: resolvedProjectId,
         environment: { type: "project-default" },
-        // Inherit the parent's provider when enhancing inside a thread;
+        // Inherit the scope thread's provider when enhancing inside a thread;
         // otherwise omit it so spawn uses the project's remembered default.
         ...(providerId ? { providerId } : {}),
-        ...(threadId ? { parentThreadId: threadId } : {}),
+        // Deliberately NOT parented to the scope thread: a hidden child
+        // reports its completion to its parent, which would inject the
+        // rewritten prompt into that thread's conversation. The rewrite
+        // belongs in the composer draft, never the timeline.
         visibility: "hidden",
         title: "Enhance prompt",
         prompt: buildEnhancePrompt(text),
