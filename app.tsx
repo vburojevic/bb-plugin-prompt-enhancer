@@ -15,7 +15,6 @@
 // shared by every composer instance (a per-instance fetch would turn every
 // composer mount into a round trip).
 import {
-  Fragment,
   useEffect,
   useRef,
   useState,
@@ -366,6 +365,15 @@ function EnhanceButton() {
   // works is exactly when a queued prompt gets refined.
   const startDisabled = busy || view.draft.isEmpty;
   const disabled = !busy && view.draft.isEmpty;
+
+  /** The pinned model's catalog entry, when one is pinned and known. */
+  const selectedModel =
+    picker.override === null
+      ? null
+      : (picker.catalog?.providers
+          .find((entry) => entry.id === picker.override?.providerId)
+          ?.models.find((entry) => entry.model === picker.override?.model) ??
+        null);
 
   const overrideLabel = (() => {
     if (picker.override === null) return null;
@@ -877,6 +885,62 @@ function EnhanceButton() {
                   </span>
                 </CommandItem>
               </CommandGroup>
+              {/* Reasoning section, mirroring bb's own model picker: the
+                  pinned model's levels in their own group rather than nested
+                  under a row, so the choice is visible without hunting. */}
+              {selectedModel === null ? (
+                <CommandGroup heading="Reasoning">
+                  <CommandItem
+                    value="reasoning-hint"
+                    disabled
+                    keywords={["thinking", "reasoning", "effort"]}
+                  >
+                    <span className="truncate text-xs text-muted-foreground">
+                      Pick a model to choose its reasoning level
+                    </span>
+                  </CommandItem>
+                </CommandGroup>
+              ) : selectedModel.reasoningLevels.length > 0 ? (
+                <CommandGroup heading="Reasoning">
+                  {selectedModel.reasoningLevels.map((level) => {
+                    const levelSelected =
+                      (picker.override?.reasoningLevel ?? null) === level ||
+                      (picker.override?.reasoningLevel == null &&
+                        selectedModel.defaultReasoningLevel === level);
+                    return (
+                      <CommandItem
+                        key={`reasoning-${level}`}
+                        value={`reasoning-${level}`}
+                        keywords={[
+                          "thinking",
+                          "reasoning",
+                          "effort",
+                          levelLabel(level),
+                        ]}
+                        onSelect={() =>
+                          void selectOverride({
+                            providerId: picker.override!.providerId,
+                            model: picker.override!.model,
+                            reasoningLevel: level,
+                          })
+                        }
+                      >
+                        <Icon
+                          name="Check"
+                          className={levelSelected ? undefined : "invisible"}
+                          aria-hidden
+                        />
+                        <span className="truncate">{levelLabel(level)}</span>
+                        {selectedModel.defaultReasoningLevel === level ? (
+                          <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+                            default
+                          </span>
+                        ) : null}
+                      </CommandItem>
+                    );
+                  })}
+                </CommandGroup>
+              ) : null}
               {picker.catalog?.providers.map((provider) => (
                 <CommandGroup key={provider.id} heading={provider.displayName}>
                   {provider.models.map((model) => {
@@ -884,89 +948,39 @@ function EnhanceButton() {
                       picker.override !== null &&
                       picker.override.providerId === provider.id &&
                       picker.override.model === model.model;
-                    // Reasoning levels expand under the selected model —
-                    // same progressive disclosure as bb's own composer
-                    // picker, so the list stays scannable.
-                    const showLevels = selected && model.reasoningLevels.length > 1;
                     return (
-                      <Fragment key={`${provider.id}:${model.model}`}>
-                        <CommandItem
-                          value={`${provider.id}:${model.model}`}
-                          keywords={[
-                            provider.displayName,
-                            model.displayName,
-                            model.model,
-                          ]}
-                          onSelect={() =>
-                            void selectOverride({
-                              providerId: provider.id,
-                              model: model.model,
-                              // Keep the level when re-picking the same
-                              // model; a different model starts at default.
-                              reasoningLevel: selected
-                                ? (picker.override?.reasoningLevel ?? null)
-                                : null,
-                            })
-                          }
-                        >
-                          <Icon
-                            name="Check"
-                            className={selected ? undefined : "invisible"}
-                            aria-hidden
-                          />
-                          <span className="truncate">{model.displayName}</span>
-                          {model.isDefault ? (
-                            <span className="ml-auto shrink-0 text-xs text-muted-foreground">
-                              default
-                            </span>
-                          ) : null}
-                        </CommandItem>
-                        {showLevels
-                          ? model.reasoningLevels.map((level) => {
-                              const levelSelected =
-                                (picker.override?.reasoningLevel ?? null) ===
-                                  level ||
-                                (picker.override?.reasoningLevel == null &&
-                                  model.defaultReasoningLevel === level);
-                              return (
-                                <CommandItem
-                                  key={`${provider.id}:${model.model}:${level}`}
-                                  value={`${provider.id}:${model.model}:${level}`}
-                                  keywords={[
-                                    model.displayName,
-                                    "thinking",
-                                    "reasoning",
-                                    "effort",
-                                    level,
-                                  ]}
-                                  onSelect={() =>
-                                    void selectOverride({
-                                      providerId: provider.id,
-                                      model: model.model,
-                                      reasoningLevel: level,
-                                    })
-                                  }
-                                >
-                                  <Icon
-                                    name="Check"
-                                    className={
-                                      levelSelected ? undefined : "invisible"
-                                    }
-                                    aria-hidden
-                                  />
-                                  <span className="truncate pl-4 text-xs text-muted-foreground">
-                                    {levelLabel(level)}
-                                  </span>
-                                  {model.defaultReasoningLevel === level ? (
-                                    <span className="ml-auto shrink-0 text-xs text-muted-foreground">
-                                      default
-                                    </span>
-                                  ) : null}
-                                </CommandItem>
-                              );
-                            })
-                          : null}
-                      </Fragment>
+                      <CommandItem
+                        key={`${provider.id}:${model.model}`}
+                        value={`${provider.id}:${model.model}`}
+                        keywords={[
+                          provider.displayName,
+                          model.displayName,
+                          model.model,
+                        ]}
+                        onSelect={() =>
+                          void selectOverride({
+                            providerId: provider.id,
+                            model: model.model,
+                            // Keep the level when re-picking the same model;
+                            // a different model starts at its own default.
+                            reasoningLevel: selected
+                              ? (picker.override?.reasoningLevel ?? null)
+                              : null,
+                          })
+                        }
+                      >
+                        <Icon
+                          name="Check"
+                          className={selected ? undefined : "invisible"}
+                          aria-hidden
+                        />
+                        <span className="truncate">{model.displayName}</span>
+                        {model.isDefault ? (
+                          <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+                            default
+                          </span>
+                        ) : null}
+                      </CommandItem>
                     );
                   })}
                 </CommandGroup>
