@@ -2,9 +2,10 @@
 //
 // Adds a unified "Enhance prompt" control to every composer: the zap half
 // rewrites the draft via the backend (a hidden bb thread), the chevron half
-// opens a dropdown to pin an explicit provider+model for the enhancement
-// (default: inherit the current thread's provider, or the project default on
-// the new-thread composer). Styling uses host token classes only.
+// opens a searchable model picker (popover + command palette) to pin an
+// explicit provider+model for the enhancement (default: inherit the current
+// thread's provider, or the project default on the new-thread composer).
+// Styling uses host token classes only.
 import { useEffect, useRef, useState } from "react";
 import {
   definePluginApp,
@@ -18,14 +19,18 @@ import type { rpcContract } from "./server";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuGroup,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
 
 const TIMEOUT_MS = 90_000;
 
@@ -63,6 +68,7 @@ function EnhanceButton() {
   const pendingIdRef = useRef<string | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [catalog, setCatalog] = useState<ModelCatalog | null>(null);
   const [override, setOverride] = useState<ModelOverride | null>(null);
   const [menuLoaded, setMenuLoaded] = useState(false);
@@ -178,6 +184,7 @@ function EnhanceButton() {
   }
 
   async function selectOverride(next: ModelOverride | null): Promise<void> {
+    setPickerOpen(false);
     try {
       await rpc.call("setModelOverride", { override: next });
       setOverride(next);
@@ -218,12 +225,14 @@ function EnhanceButton() {
         />
       </button>
       <div className="h-4 w-px bg-border" aria-hidden />
-      <DropdownMenu
+      <Popover
+        open={pickerOpen}
         onOpenChange={(open) => {
+          setPickerOpen(open);
           if (open && !menuLoaded) void loadMenu();
         }}
       >
-        <DropdownMenuTrigger asChild>
+        <PopoverTrigger asChild>
           <button
             type="button"
             className={groupHalfClass("w-5")}
@@ -232,56 +241,76 @@ function EnhanceButton() {
           >
             <Icon name="ChevronDown" className="size-3.5" aria-hidden />
           </button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-64">
-          <DropdownMenuLabel>Enhancer model</DropdownMenuLabel>
-          <DropdownMenuItem onSelect={() => void selectOverride(null)}>
-            <Icon
-              name="Check"
-              className={override === null ? undefined : "invisible"}
-              aria-hidden
-            />
-            Provider default
-          </DropdownMenuItem>
-          {catalog === null ? (
-            <DropdownMenuItem disabled>Loading…</DropdownMenuItem>
-          ) : (
-            catalog.providers.map((provider) => (
-              <DropdownMenuGroup key={provider.id}>
-                <DropdownMenuSeparator />
-                <DropdownMenuLabel>{provider.displayName}</DropdownMenuLabel>
-                {provider.models.map((model) => {
-                  const selected =
-                    override !== null &&
-                    override.providerId === provider.id &&
-                    override.model === model.model;
-                  return (
-                    <DropdownMenuItem
-                      key={`${provider.id}:${model.model}`}
-                      onSelect={() =>
-                        void selectOverride({
-                          providerId: provider.id,
-                          model: model.model,
-                        })
-                      }
-                    >
-                      <Icon
-                        name="Check"
-                        className={selected ? undefined : "invisible"}
-                        aria-hidden
-                      />
-                      <span className="truncate">
-                        {model.displayName}
-                        {model.isDefault ? " (default)" : ""}
-                      </span>
-                    </DropdownMenuItem>
-                  );
-                })}
-              </DropdownMenuGroup>
-            ))
-          )}
-        </DropdownMenuContent>
-      </DropdownMenu>
+        </PopoverTrigger>
+        <PopoverContent align="end" className="w-72 p-0">
+          <Command>
+            <CommandInput placeholder="Search models…" />
+            <CommandList className="max-h-72">
+              <CommandEmpty>
+                {catalog === null
+                  ? "Loading models…"
+                  : "No models match your search."}
+              </CommandEmpty>
+              <CommandGroup heading="General">
+                <CommandItem
+                  value="provider-default"
+                  keywords={["inherit", "thread", "project", "default"]}
+                  onSelect={() => void selectOverride(null)}
+                >
+                  <Icon
+                    name="Check"
+                    className={override === null ? undefined : "invisible"}
+                    aria-hidden
+                  />
+                  <span className="truncate">Provider default</span>
+                  <span className="ml-auto text-xs text-muted-foreground">
+                    inherit
+                  </span>
+                </CommandItem>
+              </CommandGroup>
+              {catalog?.providers.map((provider) => (
+                <CommandGroup key={provider.id} heading={provider.displayName}>
+                  {provider.models.map((model) => {
+                    const selected =
+                      override !== null &&
+                      override.providerId === provider.id &&
+                      override.model === model.model;
+                    return (
+                      <CommandItem
+                        key={`${provider.id}:${model.model}`}
+                        value={`${provider.id}:${model.model}`}
+                        keywords={[
+                          provider.displayName,
+                          model.displayName,
+                          model.model,
+                        ]}
+                        onSelect={() =>
+                          void selectOverride({
+                            providerId: provider.id,
+                            model: model.model,
+                          })
+                        }
+                      >
+                        <Icon
+                          name="Check"
+                          className={selected ? undefined : "invisible"}
+                          aria-hidden
+                        />
+                        <span className="truncate">{model.displayName}</span>
+                        {model.isDefault ? (
+                          <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+                            default
+                          </span>
+                        ) : null}
+                      </CommandItem>
+                    );
+                  })}
+                </CommandGroup>
+              ))}
+            </CommandList>
+          </Command>
+        </PopoverContent>
+      </Popover>
     </div>
   );
 }
