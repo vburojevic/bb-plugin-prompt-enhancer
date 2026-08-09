@@ -324,8 +324,10 @@ function EnhanceButton() {
   }, [rpc]);
 
   // While busy the spark half stays enabled — it becomes the cancel button.
-  const startDisabled = busy || view.draft.isEmpty || view.run.isRunning;
-  const disabled = !busy && (view.draft.isEmpty || view.run.isRunning);
+  // A running agent does NOT disable enhancing: drafting while the agent
+  // works is exactly when a queued prompt gets refined.
+  const startDisabled = busy || view.draft.isEmpty;
+  const disabled = !busy && view.draft.isEmpty;
 
   const overrideLabel = (() => {
     if (picker.override === null) return null;
