@@ -8,9 +8,19 @@
 // single-use: they are stopped and deleted as soon as the enhancement
 // resolves (done, error, cancel, or orphaned by a restart).
 //
-// The user can pin an explicit provider+model for the enhancement thread via
-// the composer dropdown; without an override the scope thread's provider is
-// inherited and the model stays at that provider's default.
+// A run belongs to a COMPOSER SCOPE, not to a mounted component. Rewrites take
+// tens of seconds, so leaving the thread mid-run is normal — and the composer
+// action unmounts when you do. Everything needed to pick a run back up (its
+// scope key, the original draft, the preview gate, the mention labels) is
+// therefore stored on the row, and `resumeForScope` hands it to whichever
+// composer mounts for that scope next. That survives switching threads, a
+// window reload, and a plugin reload alike; the frontend's in-memory map is
+// only a flicker-free fast path. A run is redelivered until the client
+// acknowledges that its text actually landed in the draft.
+//
+// The user can pin an explicit provider+model for the enhancement thread on
+// the plugin's settings page; without an override the scope thread's provider
+// is inherited and the model stays at that provider's default.
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 import { buildEnhancePrompt } from "./lib/enhance-prompt";
@@ -59,6 +69,23 @@ const enhancementSchema = z.object({
 });
 type Enhancement = z.infer<typeof enhancementSchema>;
 
+/**
+ * Everything a composer needs to adopt a run it did not itself start — the
+ * whole point being that the composer that started it is usually gone by the
+ * time the rewrite lands.
+ */
+const resumeRunSchema = z.object({
+  id: z.string(),
+  originalText: z.string(),
+  previewGate: z.boolean(),
+  /** Absolute time the client stops calling this run "on schedule". */
+  deadline: z.number(),
+  mentionLabels: z.array(z.string()),
+  status: z.enum(["pending", "done", "error"]),
+  enhanced: z.string().nullable(),
+  error: z.string().nullable(),
+});
+
 /** bb's reasoning levels, as accepted by threads.spawn. */
 const reasoningLevelSchema = z.enum([
   "none",
@@ -88,6 +115,13 @@ const PROGRESS_MAX_MS = 190_000;
 /** Tail of the scope thread's last output shown to the rewriter as context. */
 const CONTEXT_OUTPUT_CAP = 1500;
 
+/**
+ * How long a finished-but-undelivered run stays adoptable. Coming back to a
+ * thread a minute later should still land the rewrite; coming back tomorrow
+ * should not dump a forgotten one into a draft the user has moved on from.
+ */
+const RESUME_MAX_AGE_MS = 15 * 60_000;
+
 const modelCatalogSchema = z.object({
   providers: z.array(
     z.object({
@@ -113,9 +147,15 @@ export const rpcContract = defineRpcContract({
     input: z
       .object({
         text: z.string().min(1).max(100_000),
+        /** Composer scope identity; the key a later mount resumes by. */
+        scopeKey: z.string().min(1),
         threadId: z.string().nullable(),
         projectId: z.string().nullable(),
         attachmentCount: z.number().int().min(0),
+        /** Whether the result should land in a preview dialog, not the draft. */
+        previewGate: z.boolean(),
+        /** Structured @-mention labels in the draft, for the dropped-ref guard. */
+        mentionLabels: z.array(z.string()),
       })
       .strict(),
     output: z.object({ id: z.string(), timeoutMs: z.number() }),
@@ -123,6 +163,20 @@ export const rpcContract = defineRpcContract({
   getEnhancement: {
     input: z.object({ id: z.string() }).strict(),
     output: z.object({ enhancement: enhancementSchema.nullable() }),
+  },
+  /**
+   * The run this composer scope should be showing, if any — a still-running
+   * one to keep waiting on, or a finished one whose text never reached a
+   * draft. This is what makes leaving and returning to a thread lossless.
+   */
+  resumeForScope: {
+    input: z.object({ scopeKey: z.string().min(1) }).strict(),
+    output: z.object({ run: resumeRunSchema.nullable() }),
+  },
+  /** The run's result reached the draft (or the user dismissed it): retire it. */
+  ackEnhancement: {
+    input: z.object({ id: z.string() }).strict(),
+    output: z.object({}),
   },
   cancelEnhance: {
     input: z.object({ id: z.string() }).strict(),
@@ -157,6 +211,11 @@ interface EnhancementRow {
   created_at: number;
   model_key: string | null;
   duration_ms: number | null;
+  scope_key: string | null;
+  deadline_at: number | null;
+  consumed_at: number | null;
+  preview_gate: number;
+  mention_labels: string | null;
 }
 
 function toEnhancement(row: EnhancementRow): Enhancement {
@@ -169,6 +228,32 @@ function toEnhancement(row: EnhancementRow): Enhancement {
     enhanced: row.enhanced,
     error: row.error,
     createdAt: row.created_at,
+  };
+}
+
+function toResumeRun(row: EnhancementRow): z.infer<typeof resumeRunSchema> {
+  // A corrupt or pre-migration labels column must not sink a resume: the
+  // labels only sharpen a warning, so an empty list is a safe reading.
+  let mentionLabels: string[] = [];
+  try {
+    const parsed: unknown = JSON.parse(row.mention_labels ?? "[]");
+    if (Array.isArray(parsed)) {
+      mentionLabels = parsed.filter(
+        (label): label is string => typeof label === "string",
+      );
+    }
+  } catch {
+    // Keep the empty list.
+  }
+  return {
+    id: row.id,
+    originalText: row.original_text,
+    previewGate: row.preview_gate === 1,
+    deadline: row.deadline_at ?? row.created_at,
+    mentionLabels,
+    status: row.status as "pending" | "done" | "error",
+    enhanced: row.enhanced,
+    error: row.error,
   };
 }
 
@@ -203,11 +288,23 @@ export default async function plugin(bb: BbPluginApi) {
     )`,
     `ALTER TABLE enhancements ADD COLUMN model_key TEXT`,
     `ALTER TABLE enhancements ADD COLUMN duration_ms INTEGER`,
+    // Resume support: a run is owned by a composer scope and stays adoptable
+    // until a client confirms its text landed somewhere the user can see.
+    `ALTER TABLE enhancements ADD COLUMN scope_key TEXT`,
+    `ALTER TABLE enhancements ADD COLUMN deadline_at INTEGER`,
+    `ALTER TABLE enhancements ADD COLUMN consumed_at INTEGER`,
+    `ALTER TABLE enhancements ADD COLUMN preview_gate INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE enhancements ADD COLUMN mention_labels TEXT`,
+    `CREATE INDEX IF NOT EXISTS enhancements_by_scope
+       ON enhancements (scope_key, created_at)`,
   ]);
 
   const insertPending = db.prepare(
-    `INSERT INTO enhancements (id, scope_thread_id, original_text, status, model_key, created_at)
-     VALUES (?, ?, ?, 'pending', ?, ?)`,
+    `INSERT INTO enhancements (
+       id, scope_key, scope_thread_id, original_text, status, model_key,
+       created_at, deadline_at, preview_gate, mention_labels
+     )
+     VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
   );
   const recentDurations = db.prepare(
     `SELECT duration_ms FROM enhancements
@@ -218,9 +315,9 @@ export default async function plugin(bb: BbPluginApi) {
   db.prepare(`DELETE FROM enhancements WHERE created_at < ?`).run(
     Date.now() - 7 * 24 * 60 * 60 * 1000,
   );
-  // Rows still pending at load lost their completion event to a restart or
-  // plugin reload; nobody will ever resolve them, so fail them now and reap
-  // any child threads they left running.
+  // Rows still pending at load lost their progress poller to a restart or a
+  // plugin reload. Their child threads usually kept working, so these are
+  // re-attached below rather than failed.
   const orphans = db
     .prepare(`SELECT * FROM enhancements WHERE status = 'pending'`)
     .all() as EnhancementRow[];
@@ -239,7 +336,23 @@ export default async function plugin(bb: BbPluginApi) {
   const markCancelled = db.prepare(
     `UPDATE enhancements SET status = 'cancelled' WHERE id = ? AND status = 'pending'`,
   );
+  const markConsumed = db.prepare(
+    `UPDATE enhancements SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL`,
+  );
   const byId = db.prepare(`SELECT * FROM enhancements WHERE id = ?`);
+  /**
+   * The run a composer mounting on this scope should be showing: the newest
+   * one that is either still working or finished without its text ever
+   * reaching a draft. Cancelled runs are excluded — the user already said no.
+   */
+  const resumableByScope = db.prepare(
+    `SELECT * FROM enhancements
+     WHERE scope_key = ?
+       AND consumed_at IS NULL
+       AND status IN ('pending', 'done', 'error')
+       AND created_at >= ?
+     ORDER BY created_at DESC LIMIT 1`,
+  );
 
   /**
    * Hidden enhancement threads are single-use scratch space: once the row has
@@ -257,11 +370,6 @@ export default async function plugin(bb: BbPluginApi) {
         // Already gone, or the host is mid-reload — either way, done trying.
       }
     })();
-  }
-
-  for (const orphan of orphans) {
-    markError.run("Interrupted by a restart", orphan.id);
-    cleanupChildThread(orphan.child_thread_id);
   }
 
   function publish(id: string, status: "done" | "error") {
@@ -312,12 +420,17 @@ export default async function plugin(bb: BbPluginApi) {
       void (async () => {
         try {
           const row = byId.get(id) as EnhancementRow | undefined;
-          if (
-            row === undefined ||
-            row.status !== "pending" ||
-            Date.now() - startedAt > PROGRESS_MAX_MS
-          ) {
+          if (row === undefined || row.status !== "pending") {
             stopProgress(id);
+            return;
+          }
+          if (Date.now() - startedAt > PROGRESS_MAX_MS) {
+            // Give the row a terminal state instead of abandoning it as
+            // pending forever: a client resuming this scope must learn that
+            // the run is dead rather than wait on it indefinitely.
+            stopProgress(id);
+            fail(id, "The enhancement took too long and was stopped");
+            cleanupChildThread(childThreadId);
             return;
           }
           const { output } = await bb.sdk.threads.output({
@@ -386,6 +499,47 @@ export default async function plugin(bb: BbPluginApi) {
     }, PROGRESS_POLL_MS);
     progressTimers.set(id, timer);
   }
+
+  /**
+   * Rows left pending by a restart or a plugin reload. The hidden child thread
+   * is a real bb thread and does NOT stop when this plugin does, so failing
+   * these outright threw away rewrites that were still being written — the
+   * same loss the user sees on a thread switch, one layer down. Re-attach a
+   * poller to every child that is still there; only fail the ones whose child
+   * is genuinely gone (or was never spawned, because the crash beat spawn).
+   *
+   * Detached and fully guarded: this runs during plugin load, where an
+   * escaping rejection would take the whole load down with it.
+   */
+  void (async () => {
+    for (const orphan of orphans) {
+      try {
+        if (orphan.child_thread_id === null) {
+          fail(orphan.id, "Interrupted by a restart");
+          continue;
+        }
+        const child = await bb.sdk.threads.get({
+          threadId: orphan.child_thread_id,
+        });
+        if (child.status === "error") {
+          fail(orphan.id, "The enhancement thread failed");
+          cleanupChildThread(orphan.child_thread_id);
+          continue;
+        }
+        // Idle children resolve on the poller's very first tick, so the same
+        // path covers "finished while we were down" and "still writing".
+        startProgress(orphan.id, orphan.child_thread_id);
+      } catch {
+        // The child thread is unreachable or deleted; nothing will ever
+        // resolve this row, so give it a terminal state now.
+        try {
+          fail(orphan.id, "Interrupted by a restart");
+        } catch {
+          // Stale handle mid-reload — nothing safe left to do.
+        }
+      }
+    }
+  })();
 
   // Provider/model catalog. Menu opens always answer from cache; a stale
   // cache is served immediately and refreshed in the background
@@ -593,7 +747,15 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.rpc.register(rpcContract, {
-    async startEnhance({ text, threadId, projectId, attachmentCount }) {
+    async startEnhance({
+      text,
+      scopeKey,
+      threadId,
+      projectId,
+      attachmentCount,
+      previewGate,
+      mentionLabels,
+    }) {
       const id = crypto.randomUUID();
       // Model key drives the adaptive timeout: history for THIS model is the
       // only meaningful predictor. All lookups are local and best-effort.
@@ -618,7 +780,21 @@ export default async function plugin(bb: BbPluginApi) {
         duration_ms: number;
       }[]).map((row) => row.duration_ms);
       const timeoutMs = adaptiveTimeoutMs(durations);
-      insertPending.run(id, threadId, text, modelKey, Date.now());
+      const startedAt = Date.now();
+      // A composer that mounts on this scope later reconstructs its entire
+      // waiting state from this row, so everything it needs is written here
+      // and not kept only in the starting client's memory.
+      insertPending.run(
+        id,
+        scopeKey,
+        threadId,
+        text,
+        modelKey,
+        startedAt,
+        startedAt + timeoutMs,
+        previewGate ? 1 : 0,
+        JSON.stringify(mentionLabels),
+      );
       // NON-BLOCKING: completion arrives via thread.idle / thread.failed below.
       void runEnhance(id, text, threadId, projectId, attachmentCount);
       return { id, timeoutMs };
@@ -626,6 +802,16 @@ export default async function plugin(bb: BbPluginApi) {
     getEnhancement({ id }) {
       const row = byId.get(id) as EnhancementRow | undefined;
       return { enhancement: row ? toEnhancement(row) : null };
+    },
+    resumeForScope({ scopeKey }) {
+      const row = resumableByScope.get(scopeKey, Date.now() - RESUME_MAX_AGE_MS) as
+        | EnhancementRow
+        | undefined;
+      return { run: row ? toResumeRun(row) : null };
+    },
+    ackEnhancement({ id }) {
+      markConsumed.run(Date.now(), id);
+      return {};
     },
     cancelEnhance({ id }) {
       const row = byId.get(id) as EnhancementRow | undefined;

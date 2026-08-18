@@ -17,7 +17,7 @@ test("extracts file paths, mentions, urls, and code spans", () => {
 });
 
 test("email addresses are not treated as @mentions", () => {
-  const refs = extractReferences("mail claude@caffeinatedcode.co about it");
+  const refs = extractReferences("mail dev@example.com about it");
   assert.ok(!refs.some((token) => token.startsWith("@")));
 });
 

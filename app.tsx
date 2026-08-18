@@ -1,25 +1,18 @@
 // bb-plugin-prompt-enhancer — frontend entry.
 //
-// Adds a unified "Enhance prompt" control to every composer: the spark half
-// rewrites the draft via the backend (a hidden bb thread), the chevron half
-// opens a searchable model picker (popover + command palette) to pin an
-// explicit provider+model for the enhancement (default: inherit the current
-// thread's provider, or the project default on the new-thread composer).
-// While an enhancement runs, the control shimmers and the draft gets an
-// animated text effect; the spark half doubles as a cancel button. The
-// rewrite then streams into the composer, settles with a one-shot accent
-// sweep, and offers Undo via the success toast. All motion collapses to
-// instant replacement under prefers-reduced-motion.
+// Adds an "Enhance prompt" button to every composer: it rewrites the draft via
+// the backend (a hidden bb thread). While an enhancement runs the button
+// shimmers, the draft gets an animated text effect, and the button doubles as
+// a cancel control. The rewrite then streams into the composer, settles with a
+// one-shot accent sweep, and offers Undo via the success toast. All motion
+// collapses to instant replacement under prefers-reduced-motion.
 //
-// The catalog + selection live in a module store: one fetch per window,
-// shared by every composer instance (a per-instance fetch would turn every
-// composer mount into a round trip).
-import {
-  useEffect,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+// Which provider+model does the rewriting is a settings-page choice
+// (`ModelSettingsSection`), not a composer one — it is set once and rarely
+// revisited, so it does not earn permanent real estate beside the draft.
+// Without an explicit pin the enhancement inherits the current thread's
+// provider, or the project default on the new-thread composer.
+import { useEffect, useRef, useState } from "react";
 import {
   definePluginApp,
   useComposer,
@@ -31,11 +24,6 @@ import { toast } from "sonner";
 import type { rpcContract } from "./server";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
 import {
   Command,
   CommandEmpty,
@@ -53,17 +41,15 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { ResponsiveDrawerShell } from "@/components/ui/responsive-overlay";
-import { blurActiveKeyboardInputBeforeOverlayOpen } from "@/components/ui/overlay-trigger";
-import { useIsCompactViewport } from "@/components/ui/hooks/use-compact-viewport";
 import {
-  COARSE_POINTER_COMPACT_ICON_SIZE_CLASS,
-  COARSE_POINTER_ICON_SIZE_CLASS,
-} from "@/components/ui/coarse-pointer-sizing";
+  deadlineVerdict,
+  type EnhancementSnapshot,
+} from "@/lib/deadline";
 import {
   formatMissing,
   missingReferences,
 } from "@/lib/references";
+import { scopeKey as scopeKeyOf } from "@/lib/scope-key";
 import { nextShown, REVEAL_TICK_MS } from "@/lib/reveal";
 
 const isMac = navigator.platform.toUpperCase().includes("MAC");
@@ -72,6 +58,12 @@ const SHORTCUT_HINT = isMac ? "⌘E" : "Ctrl+E";
 const SETTLE_MS = 950;
 /** Timeout used if startEnhance somehow returns without one. */
 const FALLBACK_TIMEOUT_MS = 90_000;
+/**
+ * How often a run that outlived its predicted duration re-checks with the
+ * server. It is a safety net for a completion signal that arrived while this
+ * scope had no composer mounted; the run itself is never ended from here.
+ */
+const RESYNC_MS = 4_000;
 
 interface EnhanceSignal {
   id?: string;
@@ -112,18 +104,11 @@ function levelLabel(level: ReasoningLevel): string {
   if (level === "xhigh") return "XHigh";
   return level.charAt(0).toUpperCase() + level.slice(1);
 }
-type Rpc = ReturnType<typeof useRpc<typeof rpcContract>>;
 type ComposerScope = ReturnType<typeof useComposerView>["scope"];
 
-/** One key per composer draft, shared by every state map below. */
+/** One key per composer draft — see `lib/scope-key`. */
 function scopeKey(scope: ComposerScope): string {
-  if (scope.kind === "thread" || scope.kind === "queued-message")
-    return scope.threadId;
-  if (scope.kind === "side-chat")
-    return scope.childThreadId ?? scope.parentThreadId;
-  if (scope.kind === "new-thread") return `new:${scope.projectId ?? ""}`;
-  // Exhaustive today; future scope kinds fall back to their kind tag.
-  return (scope as { kind: string }).kind;
+  return scopeKeyOf(scope);
 }
 
 // ---------------------------------------------------------------------------
@@ -131,16 +116,18 @@ function scopeKey(scope: ComposerScope): string {
 // ---------------------------------------------------------------------------
 
 /**
- * In-flight enhancement per composer scope. Lives at module level so
- * switching threads mid-run doesn't lose the enhancement: the server keeps
- * working, and when a composer for this scope mounts again it resumes from
- * here (re-locks, re-arms the deadline, and picks up the finished result).
+ * In-flight enhancement per composer scope — a CACHE, not the record. The
+ * record is the server row, which `resumeForScope` hands to whichever composer
+ * mounts on the scope next; this map only lets a remount re-lock the draft in
+ * the same frame instead of flashing an idle composer for one round trip. It
+ * is therefore allowed to be empty (window reload, plugin reload, second
+ * window) without anything being lost.
  */
 interface PendingRun {
   id: string;
   originalText: string;
   previewGate: boolean;
-  /** Absolute time after which this run counts as timed out. */
+  /** Absolute time after which the run is running longer than predicted. */
   deadline: number;
   /** Structured @-mention labels captured from the draft at start. */
   mentionLabels: readonly string[];
@@ -154,80 +141,6 @@ const pendingRuns = new Map<string, PendingRun>();
 const mentionLabelsByScope = new Map<string, readonly string[]>();
 
 // ---------------------------------------------------------------------------
-// Shared catalog/selection store (per window)
-// ---------------------------------------------------------------------------
-
-interface PickerState {
-  loaded: boolean;
-  /** The last load attempt failed; the next picker open retries. */
-  failed: boolean;
-  catalog: ModelCatalog | null;
-  override: ModelOverride | null;
-}
-
-let pickerState: PickerState = {
-  loaded: false,
-  failed: false,
-  catalog: null,
-  override: null,
-};
-let pickerInflight: Promise<void> | null = null;
-const pickerListeners = new Set<() => void>();
-
-function pickerSubscribe(listener: () => void): () => void {
-  pickerListeners.add(listener);
-  return () => pickerListeners.delete(listener);
-}
-
-function pickerNotify(): void {
-  for (const listener of pickerListeners) listener();
-}
-
-/** Single shared fetch; safe to call from every composer instance. */
-function ensurePickerLoaded(rpc: Rpc): void {
-  if (pickerState.loaded || pickerInflight !== null) return;
-  if (pickerState.failed) {
-    // A retry is starting — show "Loading…" again instead of the stale error.
-    pickerState = { ...pickerState, failed: false };
-    pickerNotify();
-  }
-  pickerInflight = (async () => {
-    try {
-      const [modelsResult, overrideResult] = await Promise.all([
-        rpc.call("listModels"),
-        rpc.call("getModelOverride"),
-      ]);
-      pickerState = {
-        loaded: true,
-        failed: false,
-        catalog: modelsResult,
-        override: overrideResult.override,
-      };
-    } catch {
-      // Leave unloaded but flag the failure so the picker can say so
-      // instead of showing an eternal "Loading…"; the next open retries.
-      pickerState = { ...pickerState, failed: true };
-    } finally {
-      pickerInflight = null;
-      pickerNotify();
-    }
-  })();
-}
-
-function setSharedOverride(next: ModelOverride | null): void {
-  pickerState = { ...pickerState, override: next };
-  pickerNotify();
-}
-
-function usePickerState(): PickerState {
-  return useSyncExternalStore(
-    pickerSubscribe,
-    () => pickerState,
-    () => pickerState,
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Animation styles — raw CSS because keyframes cannot come from the Tailwind
 // pass. Injected by a content script (the sanctioned escape hatch), removed
 // on dispose. Colors derive from host theme tokens only — never hardcoded.
@@ -236,9 +149,20 @@ function usePickerState(): PickerState {
 // ---------------------------------------------------------------------------
 
 const SHIMMER_CSS = `
-@keyframes prompt-enhancer-sweep {
+@keyframes prompt-enhancer-pill-sweep {
   0% { background-position: 200% 0; }
   100% { background-position: -200% 0; }
+}
+/* Only the band layer travels; the solid underlay stays pinned. */
+@keyframes prompt-enhancer-text-sweep {
+  from { background-position: -50vw 0, 0 0; }
+  to { background-position: 50vw 0, 0 0; }
+}
+/* One-shot variant: starts and ends fully clear of the viewport, so there is
+   no band on screen at either end of the settle. */
+@keyframes prompt-enhancer-text-settle {
+  from { background-position: -70vw 0, 0 0; }
+  to { background-position: 110vw 0, 0 0; }
 }
 .prompt-enhancer-pill-busy {
   background-image: linear-gradient(
@@ -249,52 +173,72 @@ const SHIMMER_CSS = `
   );
   background-size: 250% 100%;
   background-repeat: no-repeat;
-  animation: prompt-enhancer-sweep 1.4s linear infinite;
+  animation: prompt-enhancer-pill-sweep 1.4s linear infinite;
 }
 /* Text effects use TWO gradient layers clipped to the glyphs: a moving
    non-repeating band on top of a solid base. The solid underlay means text
    outside the band always renders at exactly the base color — no repeated
    ghost bands drifting through, and (for the settle) an end state identical
    to normal text, so removing the class is invisible.
+
+   background-attachment: fixed is load-bearing, not decoration. The host
+   turns one whole-draft effect into ONE DECORATION SPAN PER DOCUMENT SEGMENT
+   — per block, and again wherever a mention pill splits a paragraph's text
+   nodes. Box-relative sizing therefore handed every span its own gradient box
+   and its own sweep: short lines flashed while long ones crawled, and the
+   band restarted at every mention. That is the "line by line" shimmer.
+   Anchoring the background to the viewport gives every span one shared
+   coordinate space, so a single band crosses the whole draft, hitting the
+   same x on every line. (Under a transformed ancestor the anchor becomes that
+   ancestor's box instead of the viewport — still one shared box, so the sweep
+   stays unified.)
+
+   The band's core sits at 50% of a 100vw image, so travelling -50vw → 50vw
+   walks it across the viewport exactly once per cycle with no dead frame.
    90deg on purpose: the band must vary along x only, so it crosses every
    wrapped line at the same spot; a diagonal band reads as blotches. */
 .prompt-enhancer-draft {
   background-image:
     linear-gradient(
       90deg,
-      transparent 38%,
+      transparent 30%,
       var(--foreground) 50%,
-      transparent 62%
+      transparent 70%
     ),
     linear-gradient(
       90deg,
-      color-mix(in oklab, var(--foreground) 70%, transparent),
-      color-mix(in oklab, var(--foreground) 70%, transparent)
+      color-mix(in oklab, var(--foreground) 62%, transparent),
+      color-mix(in oklab, var(--foreground) 62%, transparent)
     );
-  background-size: 250% 100%, 100% 100%;
+  background-size: 100vw 100%, 100% 100%;
   background-repeat: no-repeat;
+  background-attachment: fixed;
   background-clip: text;
   -webkit-background-clip: text;
   color: transparent;
-  animation: prompt-enhancer-sweep 1.4s linear infinite;
+  animation: prompt-enhancer-text-sweep 1.9s linear infinite;
 }
 .prompt-enhancer-settle {
   background-image:
     linear-gradient(
       90deg,
-      transparent 40%,
+      transparent 34%,
       var(--primary) 50%,
-      transparent 60%
+      transparent 66%
     ),
     linear-gradient(90deg, var(--foreground), var(--foreground));
-  background-size: 250% 100%, 100% 100%;
+  background-size: 100vw 100%, 100% 100%;
   background-repeat: no-repeat;
+  background-attachment: fixed;
   background-clip: text;
   -webkit-background-clip: text;
   color: transparent;
-  /* fill-mode both: holds the band offscreen at the end, so the text sits
+  /* linear, not an ease-out: the band now travels a viewport-sized distance
+     rather than a span-sized one, so front-loaded easing spent the whole
+     sweep in the first ~0.15s and the accent never registered.
+     fill-mode both: holds the band offscreen at both ends, so the text sits
      at plain foreground until the class is removed — no end-of-sweep snap. */
-  animation: prompt-enhancer-sweep 0.9s cubic-bezier(0.16, 1, 0.3, 1) 1 both;
+  animation: prompt-enhancer-text-settle 0.9s linear 1 both;
 }
 @media (prefers-reduced-motion: reduce) {
   .prompt-enhancer-pill-busy,
@@ -318,18 +262,6 @@ function prefersReducedMotion(): boolean {
 // Composer control
 // ---------------------------------------------------------------------------
 
-/** One half of the split control — chrome comes from the group wrapper. */
-function groupHalfClass(extra?: string): string {
-  return cn(
-    "flex h-7 items-center justify-center text-muted-foreground",
-    "transition-[color,background-color,transform] duration-150",
-    "hover:bg-state-hover hover:text-foreground",
-    "active:scale-95 motion-reduce:transition-none motion-reduce:active:scale-100",
-    "disabled:pointer-events-none disabled:opacity-50",
-    extra,
-  );
-}
-
 function EnhanceButton() {
   const composer = useComposer();
   const view = useComposerView();
@@ -337,10 +269,19 @@ function EnhanceButton() {
   const [busy, setBusy] = useState(false);
   const [cancelHover, setCancelHover] = useState(false);
   const [preview, setPreview] = useState<{
+    /** The run behind this preview, acknowledged once the user decides. */
+    id: string;
     original: string;
     enhanced: string;
   } | null>(null);
   const pendingIdRef = useRef<string | null>(null);
+  /**
+   * The run whose result is currently landing in the draft. Separate from
+   * `pendingIdRef`, which is cleared the moment the text is in hand: delivery
+   * is only acknowledged once the reveal actually finishes, so leaving the
+   * thread mid-reveal leaves the run adoptable and it re-types on return.
+   */
+  const deliveringIdRef = useRef<string | null>(null);
   const originalTextRef = useRef<string>("");
   /** Whether the pending enhancement should preview instead of auto-apply. */
   const previewGateRef = useRef(false);
@@ -357,46 +298,13 @@ function EnhanceButton() {
   const revealTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const [pickerOpen, setPickerOpen] = useState(false);
-  const picker = usePickerState();
   const myScopeKey = scopeKey(view.scope);
-  const isCompact = useIsCompactViewport();
 
-  // Eagerly warm the shared store so the tooltip and check marks reflect the
-  // remembered selection without opening the picker first.
-  useEffect(() => {
-    ensurePickerLoaded(rpc);
-  }, [rpc]);
-
-  // While busy the spark half stays enabled — it becomes the cancel button.
+  // While busy the button stays enabled — it becomes the cancel button.
   // A running agent does NOT disable enhancing: drafting while the agent
   // works is exactly when a queued prompt gets refined.
   const startDisabled = busy || view.draft.isEmpty;
   const disabled = !busy && view.draft.isEmpty;
-
-  /** The pinned model's catalog entry, when one is pinned and known. */
-  const selectedModel =
-    picker.override === null
-      ? null
-      : (picker.catalog?.providers
-          .find((entry) => entry.id === picker.override?.providerId)
-          ?.models.find((entry) => entry.model === picker.override?.model) ??
-        null);
-
-  const overrideLabel = (() => {
-    if (picker.override === null) return null;
-    const provider = picker.catalog?.providers.find(
-      (entry) => entry.id === picker.override?.providerId,
-    );
-    const model = provider?.models.find(
-      (entry) => entry.model === picker.override?.model,
-    );
-    const level = picker.override.reasoningLevel;
-    const suffix = level ? ` · ${levelLabel(level)}` : "";
-    return model === undefined || provider === undefined
-      ? `${picker.override.model}${suffix}`
-      : `${provider.displayName} · ${model.displayName}${suffix}`;
-  })();
 
   function stopTimers(): void {
     if (timeoutRef.current !== null) {
@@ -483,6 +391,12 @@ function EnhanceButton() {
     setCancelHover(false);
     composer.setInputLock(false);
     composer.setTextEffect({ className: "prompt-enhancer-settle" });
+    // The whole rewrite is in the draft now — this is the moment delivery is
+    // real, and the only moment the run stops being offered to this scope.
+    if (deliveringIdRef.current !== null) {
+      ackRun(deliveringIdRef.current);
+      deliveringIdRef.current = null;
+    }
     notifyEnhanced(finalText);
     settleTimerRef.current = setTimeout(() => {
       try {
@@ -519,6 +433,10 @@ function EnhanceButton() {
       }
       if (done) {
         revealRef.current = null;
+        if (deliveringIdRef.current !== null) {
+          ackRun(deliveringIdRef.current);
+          deliveringIdRef.current = null;
+        }
         notifyEnhanced(text);
         clearPending();
         try {
@@ -566,42 +484,104 @@ function EnhanceButton() {
     }, REVEAL_TICK_MS);
   }
 
-  /** The run for this scope finished successfully: preview or reveal. */
-  function resolveDone(enhanced: string): void {
+  /**
+   * The run's result reached the user — in the draft, in the preview dialog's
+   * verdict, or as an error toast. Until this lands, the server keeps offering
+   * the run to whichever composer mounts on this scope, which is what makes
+   * leaving mid-run lossless; without it, a delivered rewrite would be
+   * re-applied on every later visit.
+   */
+  function ackRun(id: string): void {
     pendingRuns.delete(myScopeKey);
+    void rpc.call("ackEnhancement", { id }).catch(() => {
+      // Best-effort: an unacked row ages out of the resume window on its own.
+    });
+  }
+
+  /** The run for this scope finished successfully: preview or reveal. */
+  function resolveDone(id: string, enhanced: string): void {
+    deliveringIdRef.current = id;
     if (previewGateRef.current) {
-      // Review mode: release the composer untouched and let the user
-      // decide in the preview dialog.
+      // Review mode: release the composer untouched and let the user decide
+      // in the preview dialog. The run stays adoptable until that decision,
+      // so leaving with the dialog open brings the rewrite back on return.
       clearPending();
-      setPreview({ original: originalTextRef.current, enhanced });
+      deliveringIdRef.current = null;
+      setPreview({ id, original: originalTextRef.current, enhanced });
       return;
     }
     // The engine finishes typing whatever remains, then settles.
     feedReveal(enhanced, true);
   }
 
-  function armTimeout(id: string, ms: number): void {
-    timeoutRef.current = setTimeout(() => {
-      if (pendingIdRef.current === id) {
-        // Tell the backend too so the hidden thread is stopped and reaped,
-        // not left running toward a result nobody will read.
-        void rpc.call("cancelEnhance", { id }).catch(() => {});
-        abortReveal();
-        clearPending();
-        toast.error("Enhancement timed out");
-      }
-    }, ms);
+  /**
+   * Re-check with the server, then act on what it says. This is the ONLY
+   * place a wait ends other than a realtime signal, and it can no longer end
+   * one by force: a run the server still calls pending simply gets waited on
+   * again. Killing healthy runs from a local clock was the bug — a rewrite
+   * takes tens of seconds, so leaving the thread and coming back is normal
+   * use, and the returning composer would reap the very run it came back for.
+   * `ms` may be <= 0, which just means "check now".
+   */
+  function armResync(id: string, ms: number): void {
+    // Only ever one re-sync in flight, so adopting a run twice (cache first,
+    // then the server's answer) cannot leave an orphaned timer behind.
+    if (timeoutRef.current !== null) clearTimeout(timeoutRef.current);
+    timeoutRef.current = setTimeout(
+      () => {
+        void (async () => {
+          if (pendingIdRef.current !== id) return;
+          let snapshot: EnhancementSnapshot | null = null;
+          let reachedServer = false;
+          try {
+            const { enhancement } = await rpc.call("getEnhancement", { id });
+            reachedServer = true;
+            if (enhancement) {
+              snapshot = {
+                status: enhancement.status,
+                enhanced: enhancement.enhanced,
+                error: enhancement.error,
+              };
+            }
+          } catch {
+            // Server unreachable; treat it as "no news" and try again.
+          }
+          if (pendingIdRef.current !== id) return;
+          if (!reachedServer) {
+            armResync(id, RESYNC_MS);
+            return;
+          }
+          const verdict = deadlineVerdict(snapshot);
+          if (verdict.kind === "deliver") {
+            resolveDone(id, verdict.enhanced);
+            return;
+          }
+          if (verdict.kind === "pending") {
+            // Slower than predicted, not stuck. The server ends runs (it
+            // reaps its own child thread); the composer only waits.
+            armResync(id, RESYNC_MS);
+            return;
+          }
+          if (verdict.kind === "error") {
+            toast.error(verdict.message);
+            ackRun(id);
+          }
+          if (verdict.kind === "unknown") ackRun(id);
+          abortReveal();
+          clearPending();
+        })();
+      },
+      Math.max(0, ms),
+    );
   }
 
   useRealtime("prompt-enhancer", (payload) => {
     const signal = payload as EnhanceSignal;
-    const run = pendingRuns.get(myScopeKey);
-    if (
-      run === undefined ||
-      signal.id !== run.id ||
-      pendingIdRef.current !== run.id
-    )
-      return;
+    const id = pendingIdRef.current;
+    // Keyed off the run this composer is actually waiting on, not off the
+    // module cache: after a reload the cache is empty while the wait, adopted
+    // from the server, is entirely real.
+    if (id === null || signal.id !== id) return;
     if (signal.status === "progress") {
       // Genuine partial output from the child thread. Preview mode keeps the
       // draft untouched until the user applies, so live paint is skipped.
@@ -609,71 +589,88 @@ function EnhanceButton() {
       feedReveal(signal.text, false);
       return;
     }
-    void (async () => {
-      try {
-        const { enhancement } = await rpc.call("getEnhancement", {
-          id: run.id,
-        });
-        if (enhancement?.status === "done" && enhancement.enhanced) {
-          resolveDone(enhancement.enhanced);
-          return;
-        } else if (enhancement?.status === "error") {
-          toast.error(enhancement.error ?? "Enhancement failed");
-        } else {
-          // Still pending — keep waiting for the next signal or the timeout.
-          return;
-        }
-      } catch {
-        toast.error("Failed to fetch the enhanced prompt");
-      }
-      abortReveal();
-      clearPending();
-    })();
+    // A terminal signal: let the shared re-sync path read the row and decide,
+    // so realtime and polling can never disagree about what happens next. Only
+    // the re-sync timer is rescheduled — a reveal already typing must keep its
+    // state, or the arriving final text would re-type from the first character.
+    armResync(id, 0);
   });
 
-  // Resume an in-flight run when a composer for this scope (re)mounts —
-  // switching threads mid-enhancement must not lose the work. Re-locks,
-  // re-arms the remaining deadline, and catches up on a completion that
-  // happened while no composer for this scope was mounted.
-  useEffect(() => {
-    const run = pendingRuns.get(myScopeKey);
-    if (run === undefined) return () => stopTimers();
+  /**
+   * Take ownership of a run this composer may not have started: lock the
+   * draft, restore the state the reveal and the dropped-reference guard need,
+   * and either deliver a finished rewrite or go back to waiting.
+   */
+  function adoptRun(run: {
+    id: string;
+    originalText: string;
+    previewGate: boolean;
+    deadline: number;
+    mentionLabels: readonly string[];
+  }): void {
     pendingIdRef.current = run.id;
     previewGateRef.current = run.previewGate;
     originalTextRef.current = run.originalText;
     mentionLabelsRef.current = run.mentionLabels;
     revealRef.current = null;
+    pendingRuns.set(myScopeKey, {
+      id: run.id,
+      originalText: run.originalText,
+      previewGate: run.previewGate,
+      deadline: run.deadline,
+      mentionLabels: run.mentionLabels,
+    });
     setBusy(true);
     composer.setInputLock(true);
     composer.setTextEffect({ className: "prompt-enhancer-draft" });
-    const remaining = run.deadline - Date.now();
-    if (remaining <= 0) {
-      void rpc.call("cancelEnhance", { id: run.id }).catch(() => {});
-      clearPending();
-      toast.error("Enhancement timed out");
-      return () => stopTimers();
-    }
-    armTimeout(run.id, remaining);
+    // An expired deadline is NOT a failure: armResync(id, 0) asks the server
+    // before deciding, and a run it still calls pending is simply waited on.
+    armResync(run.id, Math.max(0, run.deadline - Date.now()));
+  }
+
+  // Pick up whatever this scope has in flight whenever a composer for it
+  // (re)mounts. Rewrites take tens of seconds, so leaving the thread mid-run
+  // is ordinary use and the composer that started the run is usually gone by
+  // the time it lands. The module cache is only a flicker-free head start —
+  // the server is asked every time, which is what makes this survive a window
+  // reload, a plugin reload, and a second window as well as a thread switch.
+  useEffect(() => {
+    const cached = pendingRuns.get(myScopeKey);
+    if (cached !== undefined) adoptRun(cached);
+    let abandoned = false;
     void (async () => {
       try {
-        const { enhancement } = await rpc.call("getEnhancement", {
-          id: run.id,
+        const { run } = await rpc.call("resumeForScope", {
+          scopeKey: myScopeKey,
         });
-        if (pendingIdRef.current !== run.id) return;
-        if (enhancement?.status === "done" && enhancement.enhanced) {
-          resolveDone(enhancement.enhanced);
-        } else if (enhancement?.status === "error") {
-          toast.error(enhancement.error ?? "Enhancement failed");
-          clearPending();
-        } else if (enhancement?.status === "cancelled") {
+        if (abandoned || run === null) return;
+        // Already landing this exact run (a done signal beat this round trip);
+        // re-adopting would restart its reveal from the first character.
+        if (deliveringIdRef.current === run.id) return;
+        // A newer run started elsewhere (another window) wins over the cached
+        // one; the same run just refreshes the state adopted above.
+        if (pendingIdRef.current !== run.id || cached === undefined) {
+          adoptRun(run);
+        }
+        if (run.status === "done" && run.enhanced) {
+          resolveDone(run.id, run.enhanced);
+        } else if (run.status === "error" || run.status === "done") {
+          // "done" with no text is a server-side bug; surfacing it beats
+          // leaving the draft locked against a run that will never deliver.
+          toast.error(run.error ?? "Enhancement failed");
+          ackRun(run.id);
           clearPending();
         }
-        // Still pending: realtime signals and the timeout take it from here.
+        // Still pending: realtime signals and the re-sync take it from here.
       } catch {
-        // Realtime signals and the timeout still cover this run.
+        // Nothing in flight that we can see; the cached run (if any) still
+        // has its own re-sync running.
       }
     })();
-    return () => stopTimers();
+    return () => {
+      abandoned = true;
+      stopTimers();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [myScopeKey]);
 
@@ -697,14 +694,21 @@ function EnhanceButton() {
       .call("getPrefs")
       .then((prefs) => prefs.previewBeforeApply)
       .catch(() => false);
+    const mentionLabels = mentionLabelsByScope.get(myScopeKey) ?? [];
+    const originalText = composer.text;
     let id: string;
     let timeoutMs = FALLBACK_TIMEOUT_MS;
     try {
+      // Everything a future composer needs to adopt this run travels with the
+      // request: the run is owned by the scope, not by this component.
       ({ id, timeoutMs } = await rpc.call("startEnhance", {
         text,
+        scopeKey: myScopeKey,
         threadId: scopeThreadId,
         projectId: scopeProjectId,
         attachmentCount: view.draft.attachmentCount,
+        previewGate: previewGateRef.current,
+        mentionLabels: [...mentionLabels],
       }));
     } catch (error) {
       toast.error(
@@ -712,22 +716,13 @@ function EnhanceButton() {
       );
       return;
     }
-    const mentionLabels = mentionLabelsByScope.get(myScopeKey) ?? [];
-    pendingRuns.set(myScopeKey, {
+    adoptRun({
       id,
-      originalText: composer.text,
+      originalText,
       previewGate: previewGateRef.current,
       deadline: Date.now() + timeoutMs,
       mentionLabels,
     });
-    pendingIdRef.current = id;
-    originalTextRef.current = composer.text;
-    mentionLabelsRef.current = mentionLabels;
-    revealRef.current = null;
-    setBusy(true);
-    composer.setInputLock(true);
-    composer.setTextEffect({ className: "prompt-enhancer-draft" });
-    armTimeout(id, timeoutMs);
   }
 
   function cancel(): void {
@@ -741,8 +736,9 @@ function EnhanceButton() {
 
   function applyPreview(): void {
     if (preview === null) return;
-    const { enhanced } = preview;
+    const { id, enhanced } = preview;
     setPreview(null);
+    ackRun(id);
     try {
       composer.setText(enhanced);
       composer.setTextEffect({ className: "prompt-enhancer-settle" });
@@ -762,6 +758,7 @@ function EnhanceButton() {
   }
 
   function discardPreview(): void {
+    if (preview !== null) ackRun(preview.id);
     setPreview(null);
     toast("Rewrite discarded");
   }
@@ -787,282 +784,40 @@ function EnhanceButton() {
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, []);
 
-  /**
-   * Selections do NOT close the picker: model and reasoning level are one
-   * combined choice, so both can be set in a single visit (same behavior as
-   * bb's own model picker). The toast reuses one id so a run of selections
-   * updates a single toast instead of stacking.
-   */
-  async function selectOverride(next: ModelOverride | null): Promise<void> {
-    // Optimistic: the row's check moves under the finger immediately, and a
-    // failed save reverts it below.
-    const previous = picker.override;
-    setSharedOverride(next);
-    try {
-      await rpc.call("setModelOverride", { override: next });
-      toast.success(
-        next === null
-          ? "Enhancer uses the thread's provider default"
-          : `Enhancer model: ${next.model}${
-              next.reasoningLevel ? ` · ${levelLabel(next.reasoningLevel)}` : ""
-            }`,
-        { id: "prompt-enhancer-model" },
-      );
-    } catch (error) {
-      setSharedOverride(previous);
-      toast.error(
-        error instanceof Error ? error.message : "Failed to save the model",
-        { id: "prompt-enhancer-model" },
-      );
-    }
-  }
-
-  // One picker body, two shells: popover on desktop, keyboard-aware bottom
-  // sheet on mobile.
-  const pickerBody = (
-    <Command>
-            <CommandInput placeholder="Search models…" />
-            {/* Sheet list is viewport-bounded so the keyboard-lifted drawer
-                keeps its search field and results both on screen. */}
-            <CommandList
-              className={isCompact ? "max-h-[45svh]" : "max-h-72"}
-            >
-              <CommandEmpty>
-                {picker.loaded
-                  ? "No models match your search."
-                  : picker.failed
-                    ? "Couldn't load models. Close and reopen to retry."
-                    : "Loading models…"}
-              </CommandEmpty>
-              <CommandGroup heading="General">
-                <CommandItem
-                  value="provider-default"
-                  keywords={["inherit", "thread", "project", "default"]}
-                  onSelect={() => void selectOverride(null)}
-                >
-                  <Icon
-                    name="Check"
-                    className={picker.override === null ? undefined : "invisible"}
-                    aria-hidden
-                  />
-                  <span className="truncate">Provider default</span>
-                  <span className="ml-auto text-xs text-muted-foreground">
-                    inherit
-                  </span>
-                </CommandItem>
-              </CommandGroup>
-              {/* Reasoning section, mirroring bb's own model picker: the
-                  pinned model's levels in their own group rather than nested
-                  under a row, so the choice is visible without hunting. */}
-              {selectedModel === null ? (
-                <CommandGroup heading="Reasoning">
-                  <CommandItem
-                    value="reasoning-hint"
-                    disabled
-                    keywords={["thinking", "reasoning", "effort"]}
-                  >
-                    <span className="truncate text-xs text-muted-foreground">
-                      Pick a model to choose its reasoning level
-                    </span>
-                  </CommandItem>
-                </CommandGroup>
-              ) : selectedModel.reasoningLevels.length > 0 ? (
-                <CommandGroup heading="Reasoning">
-                  {selectedModel.reasoningLevels.map((level) => {
-                    const levelSelected =
-                      (picker.override?.reasoningLevel ?? null) === level ||
-                      (picker.override?.reasoningLevel == null &&
-                        selectedModel.defaultReasoningLevel === level);
-                    return (
-                      <CommandItem
-                        key={`reasoning-${level}`}
-                        value={`reasoning-${level}`}
-                        keywords={[
-                          "thinking",
-                          "reasoning",
-                          "effort",
-                          levelLabel(level),
-                        ]}
-                        onSelect={() =>
-                          void selectOverride({
-                            providerId: picker.override!.providerId,
-                            model: picker.override!.model,
-                            reasoningLevel: level,
-                          })
-                        }
-                      >
-                        <Icon
-                          name="Check"
-                          className={levelSelected ? undefined : "invisible"}
-                          aria-hidden
-                        />
-                        <span className="truncate">{levelLabel(level)}</span>
-                        {selectedModel.defaultReasoningLevel === level ? (
-                          <span className="ml-auto shrink-0 text-xs text-muted-foreground">
-                            default
-                          </span>
-                        ) : null}
-                      </CommandItem>
-                    );
-                  })}
-                </CommandGroup>
-              ) : null}
-              {picker.catalog?.providers.map((provider) => (
-                <CommandGroup key={provider.id} heading={provider.displayName}>
-                  {provider.models.map((model) => {
-                    const selected =
-                      picker.override !== null &&
-                      picker.override.providerId === provider.id &&
-                      picker.override.model === model.model;
-                    return (
-                      <CommandItem
-                        key={`${provider.id}:${model.model}`}
-                        value={`${provider.id}:${model.model}`}
-                        keywords={[
-                          provider.displayName,
-                          model.displayName,
-                          model.model,
-                        ]}
-                        onSelect={() =>
-                          void selectOverride({
-                            providerId: provider.id,
-                            model: model.model,
-                            // Keep the level when re-picking the same model;
-                            // a different model starts at its own default.
-                            reasoningLevel: selected
-                              ? (picker.override?.reasoningLevel ?? null)
-                              : null,
-                          })
-                        }
-                      >
-                        <Icon
-                          name="Check"
-                          className={selected ? undefined : "invisible"}
-                          aria-hidden
-                        />
-                        <span className="truncate">{model.displayName}</span>
-                        {model.isDefault ? (
-                          <span className="ml-auto shrink-0 text-xs text-muted-foreground">
-                            default
-                          </span>
-                        ) : null}
-                      </CommandItem>
-                    );
-                  })}
-                </CommandGroup>
-              ))}
-            </CommandList>
-    </Command>
-  );
-
-  const chevronLabel =
-    overrideLabel === null
-      ? "Choose enhancer model"
-      : `Choose enhancer model (currently ${overrideLabel})`;
-
   return (
     <div
       ref={rootRef}
       role="group"
       aria-label="Prompt enhancer"
       aria-busy={busy}
-      className={cn(
-        "flex items-center overflow-hidden rounded-md border border-input",
-        busy && "prompt-enhancer-pill-busy",
-      )}
+      className="flex items-center"
     >
+      {/* Same idiom as the Prompts plugin's composer button, so the row
+          reads as one family: bordered 28px pill, muted-to-foreground on
+          hover, size-4 icon. */}
       <button
         type="button"
-        className={groupHalfClass(isCompact ? "w-9" : "w-7")}
+        className={cn(
+          "flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-input",
+          "text-muted-foreground transition-colors hover:bg-state-hover hover:text-foreground",
+          "disabled:pointer-events-none disabled:opacity-50",
+          busy && "prompt-enhancer-pill-busy",
+        )}
         disabled={disabled}
         onClick={() => (busy ? cancel() : void enhance())}
         onMouseEnter={() => setCancelHover(true)}
         onMouseLeave={() => setCancelHover(false)}
         aria-label={busy ? "Cancel enhancement" : "Enhance prompt"}
         title={
-          busy
-            ? "Cancel enhancement"
-            : overrideLabel === null
-              ? `Enhance prompt (${SHORTCUT_HINT})`
-              : `Enhance prompt (${SHORTCUT_HINT}) — ${overrideLabel}`
+          busy ? "Cancel enhancement" : `Enhance prompt (${SHORTCUT_HINT})`
         }
       >
         <Icon
           name={busy ? (cancelHover ? "X" : "Loading") : "AiContentGenerator01"}
-          className={cn(
-            COARSE_POINTER_ICON_SIZE_CLASS,
-            busy && !cancelHover && "animate-spin",
-          )}
+          className={cn("size-4", busy && !cancelHover && "animate-spin")}
           aria-hidden
         />
       </button>
-      <div className="h-4 w-px bg-border" aria-hidden />
-      {isCompact ? (
-        // Mobile: a keyboard-aware bottom sheet. The vendored Popover's own
-        // compact branch runs its drawer with repositionInputs=false, so
-        // focusing the search field left the list behind the on-screen
-        // keyboard. Driving ResponsiveDrawerShell directly lets vaul lift
-        // the sheet above the keyboard instead.
-        <>
-          <button
-            type="button"
-            className={groupHalfClass("w-9")}
-            aria-haspopup="dialog"
-            aria-expanded={pickerOpen}
-            aria-label={chevronLabel}
-            onClick={() => {
-              blurActiveKeyboardInputBeforeOverlayOpen();
-              ensurePickerLoaded(rpc);
-              setPickerOpen(true);
-            }}
-          >
-            <Icon
-              name="ChevronDown"
-              className={COARSE_POINTER_COMPACT_ICON_SIZE_CLASS}
-              aria-hidden
-            />
-          </button>
-          <ResponsiveDrawerShell
-            open={pickerOpen}
-            onOpenChange={(open) => {
-              setPickerOpen(open);
-              if (open) ensurePickerLoaded(rpc);
-            }}
-            srLabel="Choose enhancer model"
-            repositionInputs
-          >
-            <div className="min-h-0 px-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
-              {pickerBody}
-            </div>
-          </ResponsiveDrawerShell>
-        </>
-      ) : (
-        <Popover
-          open={pickerOpen}
-          onOpenChange={(open) => {
-            setPickerOpen(open);
-            if (open) ensurePickerLoaded(rpc);
-          }}
-        >
-          <PopoverTrigger asChild>
-            <button
-              type="button"
-              className={groupHalfClass("w-5")}
-              aria-label={chevronLabel}
-              title={
-                overrideLabel === null
-                  ? "Choose enhancer model"
-                  : `Enhancer model: ${overrideLabel}`
-              }
-            >
-              <Icon name="ChevronDown" className="size-3.5" aria-hidden />
-            </button>
-          </PopoverTrigger>
-          <PopoverContent align="end" className="w-72 p-0">
-            {pickerBody}
-          </PopoverContent>
-        </Popover>
-      )}
       <Dialog
         open={preview !== null}
         onOpenChange={(open) => {
@@ -1118,7 +873,269 @@ function EnhanceButton() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Settings section — where the enhancer model is chosen
+// ---------------------------------------------------------------------------
+
+interface PickerState {
+  status: "loading" | "ready" | "failed";
+  catalog: ModelCatalog | null;
+  override: ModelOverride | null;
+}
+
+/**
+ * The model + reasoning-level picker, rendered on the plugin's settings page.
+ * It lives here rather than in the composer so the control beside the draft
+ * stays a single button: the model is a set-once preference, not a per-draft
+ * decision, and the settings page has the room for a searchable list.
+ */
+function ModelSettingsSection() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [reloadToken, setReloadToken] = useState(0);
+  const [picker, setPicker] = useState<PickerState>({
+    status: "loading",
+    catalog: null,
+    override: null,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    setPicker((current) => ({ ...current, status: "loading" }));
+    void (async () => {
+      try {
+        const [catalog, { override }] = await Promise.all([
+          rpc.call("listModels"),
+          rpc.call("getModelOverride"),
+        ]);
+        if (!cancelled) setPicker({ status: "ready", catalog, override });
+      } catch {
+        // Flag the failure so the list can offer a retry instead of showing
+        // an eternal "Loading…".
+        if (!cancelled)
+          setPicker({ status: "failed", catalog: null, override: null });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [rpc, reloadToken]);
+
+  const { catalog, override } = picker;
+
+  /** The pinned model's catalog entry, when one is pinned and known. */
+  const selectedModel =
+    override === null
+      ? null
+      : (catalog?.providers
+          .find((entry) => entry.id === override.providerId)
+          ?.models.find((entry) => entry.model === override.model) ?? null);
+
+  const overrideLabel = (() => {
+    if (override === null) return null;
+    const provider = catalog?.providers.find(
+      (entry) => entry.id === override.providerId,
+    );
+    const model = provider?.models.find(
+      (entry) => entry.model === override.model,
+    );
+    const level = override.reasoningLevel;
+    const suffix = level ? ` · ${levelLabel(level)}` : "";
+    return model === undefined || provider === undefined
+      ? `${override.model}${suffix}`
+      : `${provider.displayName} · ${model.displayName}${suffix}`;
+  })();
+
+  /**
+   * Model and reasoning level are one combined choice, so the list stays put
+   * across selections and both can be set in a single visit (same behavior as
+   * bb's own model picker). The toast reuses one id so a run of selections
+   * updates a single toast instead of stacking.
+   */
+  async function selectOverride(next: ModelOverride | null): Promise<void> {
+    // Optimistic: the row's check moves under the finger immediately, and a
+    // failed save reverts it below.
+    const previous = override;
+    setPicker((current) => ({ ...current, override: next }));
+    try {
+      await rpc.call("setModelOverride", { override: next });
+      toast.success(
+        next === null
+          ? "Enhancer uses the thread's provider default"
+          : `Enhancer model: ${next.model}${
+              next.reasoningLevel ? ` · ${levelLabel(next.reasoningLevel)}` : ""
+            }`,
+        { id: "prompt-enhancer-model" },
+      );
+    } catch (error) {
+      setPicker((current) => ({ ...current, override: previous }));
+      toast.error(
+        error instanceof Error ? error.message : "Failed to save the model",
+        { id: "prompt-enhancer-model" },
+      );
+    }
+  }
+
+  return (
+    <div className="space-y-2">
+      <p className="text-xs text-muted-foreground">
+        Enhancements run on{" "}
+        <span className="font-medium text-foreground">
+          {overrideLabel ?? "the thread's provider default"}
+        </span>
+        .
+      </p>
+      <div className="overflow-hidden rounded-md border border-input">
+        <Command>
+          <CommandInput placeholder="Search models…" />
+          <CommandList className="max-h-72">
+            <CommandEmpty>
+              {picker.status === "ready"
+                ? "No models match your search."
+                : picker.status === "failed"
+                  ? "Couldn't load models."
+                  : "Loading models…"}
+            </CommandEmpty>
+            <CommandGroup heading="General">
+              <CommandItem
+                value="provider-default"
+                keywords={["inherit", "thread", "project", "default"]}
+                onSelect={() => void selectOverride(null)}
+              >
+                <Icon
+                  name="Check"
+                  className={override === null ? undefined : "invisible"}
+                  aria-hidden
+                />
+                <span className="truncate">Provider default</span>
+                <span className="ml-auto text-xs text-muted-foreground">
+                  inherit
+                </span>
+              </CommandItem>
+            </CommandGroup>
+            {/* Reasoning section, mirroring bb's own model picker: the
+                pinned model's levels in their own group rather than nested
+                under a row, so the choice is visible without hunting. */}
+            {selectedModel === null ? (
+              <CommandGroup heading="Reasoning">
+                <CommandItem
+                  value="reasoning-hint"
+                  disabled
+                  keywords={["thinking", "reasoning", "effort"]}
+                >
+                  <span className="truncate text-xs text-muted-foreground">
+                    Pick a model to choose its reasoning level
+                  </span>
+                </CommandItem>
+              </CommandGroup>
+            ) : selectedModel.reasoningLevels.length > 0 ? (
+              <CommandGroup heading="Reasoning">
+                {selectedModel.reasoningLevels.map((level) => {
+                  const levelSelected =
+                    (override?.reasoningLevel ?? null) === level ||
+                    (override?.reasoningLevel == null &&
+                      selectedModel.defaultReasoningLevel === level);
+                  return (
+                    <CommandItem
+                      key={`reasoning-${level}`}
+                      value={`reasoning-${level}`}
+                      keywords={[
+                        "thinking",
+                        "reasoning",
+                        "effort",
+                        levelLabel(level),
+                      ]}
+                      onSelect={() =>
+                        void selectOverride({
+                          providerId: override!.providerId,
+                          model: override!.model,
+                          reasoningLevel: level,
+                        })
+                      }
+                    >
+                      <Icon
+                        name="Check"
+                        className={levelSelected ? undefined : "invisible"}
+                        aria-hidden
+                      />
+                      <span className="truncate">{levelLabel(level)}</span>
+                      {selectedModel.defaultReasoningLevel === level ? (
+                        <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+                          default
+                        </span>
+                      ) : null}
+                    </CommandItem>
+                  );
+                })}
+              </CommandGroup>
+            ) : null}
+            {catalog?.providers.map((provider) => (
+              <CommandGroup key={provider.id} heading={provider.displayName}>
+                {provider.models.map((model) => {
+                  const selected =
+                    override !== null &&
+                    override.providerId === provider.id &&
+                    override.model === model.model;
+                  return (
+                    <CommandItem
+                      key={`${provider.id}:${model.model}`}
+                      value={`${provider.id}:${model.model}`}
+                      keywords={[
+                        provider.displayName,
+                        model.displayName,
+                        model.model,
+                      ]}
+                      onSelect={() =>
+                        void selectOverride({
+                          providerId: provider.id,
+                          model: model.model,
+                          // Keep the level when re-picking the same model;
+                          // a different model starts at its own default.
+                          reasoningLevel: selected
+                            ? (override?.reasoningLevel ?? null)
+                            : null,
+                        })
+                      }
+                    >
+                      <Icon
+                        name="Check"
+                        className={selected ? undefined : "invisible"}
+                        aria-hidden
+                      />
+                      <span className="truncate">{model.displayName}</span>
+                      {model.isDefault ? (
+                        <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+                          default
+                        </span>
+                      ) : null}
+                    </CommandItem>
+                  );
+                })}
+              </CommandGroup>
+            ))}
+          </CommandList>
+        </Command>
+      </div>
+      {picker.status === "failed" ? (
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => setReloadToken((token) => token + 1)}
+        >
+          Retry
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
 export default definePluginApp((app) => {
+  app.slots.settingsSection({
+    id: "model",
+    title: "Enhancer model",
+    description:
+      "Which provider and model rewrites your drafts. Defaults to the provider of the thread you are drafting in.",
+    component: ModelSettingsSection,
+  });
   app.composer.customize({
     id: "prompt-enhancer",
     actions: [{ id: "enhance", component: EnhanceButton }],

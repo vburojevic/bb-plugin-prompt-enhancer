@@ -1,126 +1,154 @@
-# bb-plugin-prompt-enhancer
+# Prompt Enhancer
 
-Rewrites the composer's draft prompt into a clearer, more effective prompt —
-in place, in the composer input. Click the ⚡ action in any composer: the
-draft locks briefly while a hidden bb thread (same provider as the current
-thread, or the project default on the new-thread composer) rewrites it, then
-the rewritten text replaces the draft. No external APIs — the hidden thread
-is the AI.
+A spark button in every [bb](https://getbb.app) composer that rewrites your
+rough draft into a prompt worth sending — in place, in the composer you are
+already typing in.
 
-The ▾ chevron next to the action opens the enhancer model picker: pin an
-explicit provider+model for the rewrite, or leave it on "Provider default"
-to inherit. Selecting a model expands its reasoning levels (Low, Medium,
-High, …) underneath, the same progressive disclosure bb's own composer
-picker uses; the chevron tooltip shows the pinned model and level.
+The rewriter is a hidden bb thread, so it runs on the provider you already
+have configured. No API keys, no external service, nothing leaves your bb.
 
-While a rewrite runs, the spark doubles as a cancel button (hover shows ✕).
-After a rewrite lands, the success toast offers **Undo** to restore the
-original draft. Hidden enhancement threads are stopped and deleted as soon
-as they resolve, so they never accumulate. All animation collapses to an
-instant text swap under `prefers-reduced-motion`.
-
-More:
-
-- **⌘E / Ctrl+E** enhances from the keyboard when the composer is focused.
-- The rewriter picks the shape itself: a one-line ask stays one line, while
-  genuinely multi-part work becomes a brief with a "Done when:" list.
-- Runs survive switching threads mid-enhancement, and the timeout adapts to
-  each model's measured latency instead of a flat 90s.
-- Follow-up drafts in a thread include the thread title and the tail of the
-  last assistant message as context, so "that bug" resolves to the actual bug.
-- The rewriter is told how many attachments the draft carries so it never
-  invents or drops references to them.
-- Settings (`bb plugin config prompt-enhancer`):
-  - `previewBeforeApply` (default off) — review the rewrite in an
-    Apply/Discard dialog instead of replacing the draft immediately.
-  - `customInstructions` — extra instruction appended to every rewrite.
-
-## UI components
-
-`components/ui/` is vendored source you own (the shadcn model): edit the
-files freely — they never update out from under you. Add more from the BB
-component registry (the full shadcn set, version-matched to your BB install
-via the pinned ref in `components.json`):
-
-```
-npx shadcn add @bb/dialog @bb/select
-```
-
-Run `npm install` once before `bb plugin build` — the vendored components'
-npm deps bundle into your dist. React, and BB-shimmed packages like the
-radix portal primitives and `sonner` (`import { toast } from "sonner"`
-reaches BB's own toaster), are provided by the BB app at runtime and never
-bundled. Ship `dist/` (npm tarball or committed for git installs) so
-people installing your plugin never need npm.
-
-## Manifest
-
-`package.json` is the plugin manifest. Notable fields:
-
-- `bb.server` — backend entry (required); optional `bb.app` for a frontend.
-- `bb.name` and `bb.description` — required human-facing identity.
-- `bb.branding` — required; declare `icon` as a BB icon name or a
-  plugin-relative compact SVG, or declare `logo.light` (with optional
-  `logo.dark`). Logo assets must be relative `.svg`, `.png`, or
-  `.webp` files.
-- `engines.bb` — supported bb app version range.
-- `engines.bbPluginSdk` — supported plugin SDK range (scaffold: `^0.4.1`).
-
-Run `bb plugin build` before publishing git/npm installs. It writes
-`dist/server.js` + `server.meta.json` (and, with `bb.app`, `app.js` /
-`app.css` / `app.meta.json`). Each `*.meta.json` stamps SDK major/version,
-`artifactFormatVersion`, `pluginId`, `pluginVersion`, and
-`builtWith` so managed installs can verify the artifacts.
+![A rough one-line draft rewritten into a brief with a "Done when:" list](assets/screenshots/hero.png)
 
 ## Install
 
-From this directory:
-
 ```
-bb plugin install .
+bb plugin install git:https://github.com/vburojevic/bb-plugin-prompt-enhancer.git
 ```
 
-After editing sources, reload:
+Then click the spark in any composer — or press **⌘E** (**Ctrl+E** on
+Windows and Linux) while the composer is focused.
 
-```
-bb plugin reload prompt-enhancer
-```
+## It picks the shape from the draft
 
-## Configure
+The rewriter is not told "make it longer". It is told to read the draft and
+choose: a simple ask stays roughly one line, and only genuinely multi-part
+work earns a brief with a `Done when:` list.
+
+That distinction is what keeps it usable on every message rather than only on
+the first one.
+
+| You type | You get |
+| --- | --- |
+| `fix the retry bug in payments. sometimes customers get charged twice. also add tests` | A brief with the goal restated precisely and a two-item `Done when:` list |
+| `ok fix that in our code` | One sharpened line — still one line |
+
+## Follow-ups know where they are
+
+A draft written mid-conversation is a *follow-up*: the agent already holds the
+context, so inflating it into a standalone spec re-litigates settled ground.
+The plugin detects that case and tells the rewriter to keep it a follow-up.
+
+It also passes the thread title and the tail of the last assistant message —
+used **only** to resolve vague references. Here `that` becomes the actual N+1
+problem the agent just described, and the result is still a single sentence:
+
+![A vague follow-up "ok fix that in our code" rewritten into a specific one-line instruction that names the N+1 query issue](assets/screenshots/follow-up.png)
+
+## Your references survive
+
+The rewriter is instructed to preserve verbatim every `@mention`, file path,
+identifier, code span, shell command, URL, and quoted string — they are live
+references, not prose.
+
+Then the plugin checks. It re-extracts those references from your original and
+verifies each one survived, using the composer's own structured `@`-mentions as
+ground truth rather than guessing from the text. Anything that went missing
+gets called out in a warning toast before you send:
+
+> The rewrite may have dropped: `src/checkout.ts`, @readme — check before sending.
+
+Attachments are counted and declared to the rewriter too, so it never invents
+or drops a reference to a file it cannot see.
+
+## Nothing is lost while it runs
+
+While a rewrite is in flight the draft locks and shimmers — one highlight band
+sweeping the whole draft, anchored to the viewport so it stays a single band no
+matter how many spans the editor splits your text into. The spark becomes a
+cancel button:
+
+![The composer mid-rewrite: the draft shimmering and the spark replaced by a cancel button](assets/screenshots/running.png)
+
+A run belongs to the **composer draft, not to the screen**. Leave the thread
+mid-rewrite and it keeps going; come back and it is still there — still
+shimmering if it is running, typing itself in if it finished while you were
+away. The same holds across a window reload, a plugin reload, and a second
+window, because the server looks a run up by composer scope instead of the tab
+remembering it.
+
+Nothing ends a run except you cancelling it or the server giving up. The
+predicted duration only paces the animation — a rewrite that runs long is
+waited out, not reaped. That prediction adapts per model from recent measured
+completions rather than a flat 90-second ceiling, so a fast model fails fast
+and a slow one is given room.
+
+When the rewrite lands, the toast offers **Undo** to restore your original
+draft. Hidden enhancement threads are stopped and deleted the moment they
+resolve, so they never pile up in your thread list.
+
+## Review before applying
+
+Prefer to look before it touches your draft? Turn on **Review before applying**
+and every rewrite arrives in an Apply/Discard preview showing both versions —
+with the dropped-reference warning inline, if there is one.
+
+![The Review enhanced prompt dialog showing the original and enhanced text with Discard and Apply buttons](assets/screenshots/review.png)
+
+## Choose what rewrites your drafts
+
+By default the rewrite runs on the provider of the thread you are drafting in
+(or the project default on the new-thread composer), at that provider's default
+model.
+
+Pin something else under **Settings → Prompt Enhancer**. Picking a model
+reveals its reasoning levels in their own group — the same progressive
+disclosure bb's own model picker uses. It lives in settings rather than beside
+the draft because it is a set-once preference: the composer keeps a single
+button.
+
+![The Prompt Enhancer settings page: Review before applying, Custom rewrite instructions, and the Enhancer model picker with reasoning levels](assets/screenshots/settings.png)
+
+**Custom rewrite instructions** appends a standing instruction to every rewrite
+— `keep prompts under 100 words`, `always write in German`, whatever you keep
+asking for.
+
+Both are also reachable from the CLI:
 
 ```
 bb plugin config prompt-enhancer
-bb plugin config prompt-enhancer set greeting hi
+bb plugin config prompt-enhancer set previewBeforeApply true
+bb plugin config prompt-enhancer set customInstructions "keep prompts under 100 words"
 ```
 
-## Tests
+## Details
 
-The pure logic lives in `lib/` (prompt construction, the dropped-reference
-guard, reveal pacing) and is covered by unit tests in `tests/` running on
-Node's built-in test runner:
+- **Motion** — every animation collapses to an instant text swap under
+  `prefers-reduced-motion`.
+- **Long drafts** — the draft is capped at 8000 characters in the rewrite
+  prompt; custom instructions at 500, so they can't dominate it.
+- **Language** — the rewrite stays in the language the draft was written in.
+- **Enhance while busy** — you can enhance a draft while the agent is still
+  running its previous turn.
 
-```
-npm test
-```
-
-## Types & API reference
-
-`types/bb-plugin-sdk.d.ts` (and `types/bb-plugin-sdk-app.d.ts` for the
-frontend) are the full, bundled BB plugin API — `tsconfig.json` maps
-`@bb/plugin-sdk` to them, so your editor and `tsc` see real types with no extra
-install. They are readable declarations: open them for an exact signature.
-
-The SDK surface grows with every BB release, and these are a copy. Refresh
-them from the BB you are running:
+## Development
 
 ```
-bb plugin types          # rewrite types/ from this BB
-bb plugin types --check  # CI: fail when they are out of date
+npm install
+npm test              # pure logic in lib/, on Node's built-in test runner
+bb plugin build       # dist/server.js + dist/app.js
+bb plugin install .
+bb plugin reload prompt-enhancer
 ```
 
-`bb plugin build` and `bb plugin dev` refresh them for you. Ask BB to write
-plugins for you: the `bb-plugin-authoring` skill documents the whole surface
-with examples.
+The interesting logic is pure and unit-tested in `lib/`: prompt construction,
+the dropped-reference guard, reveal pacing, adaptive timeouts, composer-scope
+identity, and what an expired deadline means. `server.ts` owns all I/O;
+`app.tsx` owns the composer UI.
 
-Confused by the API, or need something the types don't explain? Clone the BB
-repo and read the source: <https://github.com/get-bb/bb>.
+`types/` holds the bundled bb plugin API declarations, mapped to
+`@bb/plugin-sdk` by `tsconfig.json`. Refresh them from your bb with
+`bb plugin types` (`--check` in CI).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
