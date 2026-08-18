@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-prompt-enhancer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "engines": {
     "bb": ">=0.36",
@@ -25,7 +25,8 @@
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
     "lucide-react": "^1.30.0",
-    "tailwind-merge": "^3.4.0"
+    "tailwind-merge": "^3.4.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@radix-ui/react-dialog": "^1.1.19",
@@ -37,8 +38,7 @@
     "sonner": "^2.0.8",
     "tsx": "^4.23.11",
     "typescript": "^5.7.0",
-    "vaul": "^1.1.2",
-    "zod": "^4.3.6"
+    "vaul": "^1.1.2"
   },
   "scripts": {
     "test": "node --import tsx --test \"tests/*.test.ts\""
