@@ -11,9 +11,15 @@ have configured. No API keys, no external service, nothing leaves your bb.
 
 ## Install
 
+Find it in **Settings → Community** once the marketplace listing lands, or
+install it straight from git today:
+
 ```
-bb plugin install git:https://github.com/vburojevic/bb-plugin-prompt-enhancer.git
+bb plugin install git:https://github.com/vburojevic/bb-plugin-prompt-enhancer.git@main
 ```
+
+`bb` git installs take an explicit ref, so pin a release instead if you prefer:
+`…bb-plugin-prompt-enhancer.git@v0.2.1`.
 
 Then click the spark in any composer — or press **⌘E** (**Ctrl+E** on
 Windows and Linux) while the composer is focused.
