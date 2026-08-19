@@ -72,3 +72,12 @@ test("formatMissing lists up to three then elides", () => {
     "a/b, c/d, e/f, …",
   );
 });
+
+test("a URL is not also reported as a bare path", () => {
+  const refs = extractReferences(
+    "follow https://stripe.com/docs/idempotency and patch src/pay.ts",
+  );
+  assert.ok(refs.includes("https://stripe.com/docs/idempotency"));
+  assert.ok(refs.includes("src/pay.ts"));
+  assert.ok(!refs.includes("stripe.com/docs/idempotency"));
+});

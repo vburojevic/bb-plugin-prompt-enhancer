@@ -5969,12 +5969,16 @@ function deadlineVerdict(enhancement) {
 // lib/references.ts
 function extractReferences(text) {
   const out = /* @__PURE__ */ new Set();
-  for (const match of text.match(/https?:\/\/[^\s)"']+/g) ?? []) out.add(match);
+  const urls = text.match(/https?:\/\/[^\s)"']+/g) ?? [];
+  for (const match of urls) out.add(match);
   for (const match of text.match(/(?:^|\s)@[\w./-]{2,}/g) ?? [])
     out.add(match.trim());
   for (const match of text.match(/`[^`\n]+`/g) ?? [])
     out.add(match.slice(1, -1));
-  for (const match of text.match(/[\w.-]+\/[\w./-]+/g) ?? []) out.add(match);
+  for (const match of text.match(/[\w.-]+\/[\w./-]+/g) ?? []) {
+    if (urls.some((url) => url.includes(match))) continue;
+    out.add(match);
+  }
   return [...out].filter((token) => token.length > 2);
 }
 function missingReferences(original, enhanced, knownTokens = []) {

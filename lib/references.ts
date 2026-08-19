@@ -7,12 +7,18 @@
  */
 export function extractReferences(text: string): string[] {
   const out = new Set<string>();
-  for (const match of text.match(/https?:\/\/[^\s)"']+/g) ?? []) out.add(match);
+  const urls = text.match(/https?:\/\/[^\s)"']+/g) ?? [];
+  for (const match of urls) out.add(match);
   for (const match of text.match(/(?:^|\s)@[\w./-]{2,}/g) ?? [])
     out.add(match.trim());
   for (const match of text.match(/`[^`\n]+`/g) ?? [])
     out.add(match.slice(1, -1));
-  for (const match of text.match(/[\w.-]+\/[\w./-]+/g) ?? []) out.add(match);
+  for (const match of text.match(/[\w.-]+\/[\w./-]+/g) ?? []) {
+    // A URL's host+path also matches the path shape. Reporting both makes the
+    // dropped-reference warning list the same link twice, so keep the URL.
+    if (urls.some((url) => url.includes(match))) continue;
+    out.add(match);
+  }
   return [...out].filter((token) => token.length > 2);
 }
 

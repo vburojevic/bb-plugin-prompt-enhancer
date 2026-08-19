@@ -19,7 +19,7 @@ bb plugin install git:https://github.com/vburojevic/bb-plugin-prompt-enhancer.gi
 ```
 
 `bb` git installs take an explicit ref, so pin a release instead if you prefer:
-`…bb-plugin-prompt-enhancer.git@v0.2.1`.
+`…bb-plugin-prompt-enhancer.git@v0.2.2`.
 
 Then click the spark in any composer — or press **⌘E** (**Ctrl+E** on
 Windows and Linux) while the composer is focused.
@@ -52,16 +52,34 @@ problem the agent just described, and the result is still a single sentence:
 
 ## Your references survive
 
-The rewriter is instructed to preserve verbatim every `@mention`, file path,
-identifier, code span, shell command, URL, and quoted string — they are live
-references, not prose.
+`@mentions`, file paths, identifiers, code spans, shell commands, URLs and
+quoted strings are live references, not prose. The rewriter is told to carry
+every one of them through untouched — here both paths and the link come out the
+other side intact, while everything around them gets sharper:
 
-Then the plugin checks. It re-extracts those references from your original and
-verifies each one survived, using the composer's own structured `@`-mentions as
-ground truth rather than guessing from the text. Anything that went missing
-gets called out in a warning toast before you send:
+```
+fix the double charge bug in src/payments/retry.ts and src/payments/charge.ts,
+follow https://stripe.com/docs/idempotency and add a test
+```
 
-> The rewrite may have dropped: `src/checkout.ts`, @readme — check before sending.
+```
+Fix the double-charge bug in `src/payments/retry.ts` and `src/payments/charge.ts`
+by implementing idempotent request handling per Stripe's idempotency key
+guidance (https://stripe.com/docs/idempotency), so retried charge attempts do
+not create duplicate charges. Add a test covering the retry-causes-duplicate-
+charge scenario to confirm the fix.
+```
+
+Then the plugin **checks**, because "told to" is not "did". It re-extracts every
+reference from your original and verifies each one survived — using the
+composer's structured `@`-mentions as ground truth rather than guessing from the
+text — and warns you before you send.
+
+Below, a `Rewrite in at most 10 words.` custom instruction squeezed both file
+paths and the link out of the rewrite. The guard named all three before anything
+was sent:
+
+![A warning toast reading "The rewrite may have dropped: https://stripe.com/docs/idempotency, src/payments/retry.ts, src/payments/charge.ts — check before sending."](assets/screenshots/references.png)
 
 Attachments are counted and declared to the rewriter too, so it never invents
 or drops a reference to a file it cannot see.
