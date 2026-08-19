@@ -48,7 +48,7 @@ It also passes the thread title and the tail of the last assistant message —
 used **only** to resolve vague references. Here `that` becomes the actual N+1
 problem the agent just described, and the result is still a single sentence:
 
-![A vague follow-up "ok fix that in our code" rewritten into a specific one-line instruction that names the N+1 query issue](assets/screenshots/follow-up.png)
+![The thread above the composer, with a vague follow-up rewritten into a one-line instruction that names the N+1 query issue](assets/screenshots/follow-up.png)
 
 ## Your references survive
 
