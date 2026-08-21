@@ -794,11 +794,15 @@ function EnhanceButton() {
     >
       {/* Same idiom as the Prompts plugin's composer button, so the row
           reads as one family: bordered 28px pill, muted-to-foreground on
-          hover, size-4 icon. */}
+          hover, size-4 icon. On a coarse pointer it grows to 36x40 — the
+          size BB's own composer actions (expand, prompt actions, voice)
+          take there, so the row stays one family on touch too instead of
+          leaving this the one 28px target among 40px neighbours. */}
       <button
         type="button"
         className={cn(
           "flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-input",
+          "max-md:pointer-coarse:h-10 max-md:pointer-coarse:w-9",
           "text-muted-foreground transition-colors hover:bg-state-hover hover:text-foreground",
           "disabled:pointer-events-none disabled:opacity-50",
           busy && "prompt-enhancer-pill-busy",
@@ -814,7 +818,10 @@ function EnhanceButton() {
       >
         <Icon
           name={busy ? (cancelHover ? "X" : "Loading") : "AiContentGenerator01"}
-          className={cn("size-4", busy && !cancelHover && "animate-spin")}
+          className={cn(
+            "size-4 max-md:pointer-coarse:size-5",
+            busy && !cancelHover && "animate-spin",
+          )}
           aria-hidden
         />
       </button>

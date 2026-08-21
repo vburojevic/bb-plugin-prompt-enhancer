@@ -19,7 +19,7 @@ bb plugin install git:https://github.com/vburojevic/bb-plugin-prompt-enhancer.gi
 ```
 
 `bb` git installs take an explicit ref, so pin a release instead if you prefer:
-`…bb-plugin-prompt-enhancer.git@v0.2.2`.
+`…bb-plugin-prompt-enhancer.git@v0.2.4`.
 
 Then click the spark in any composer — or press **⌘E** (**Ctrl+E** on
 Windows and Linux) while the composer is focused.
@@ -153,6 +153,9 @@ bb plugin config prompt-enhancer set customInstructions "keep prompts under 100 
 - **Language** — the rewrite stays in the language the draft was written in.
 - **Enhance while busy** — you can enhance a draft while the agent is still
   running its previous turn.
+- **Touch** — on a phone the composer action grows to the same 36x40 target
+  BB's own composer buttons use, and the review step opens as a bottom sheet
+  instead of a centred dialog.
 
 ## Development
 

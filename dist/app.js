@@ -6536,6 +6536,7 @@ function EnhanceButton() {
             type: "button",
             className: cn(
               "flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-input",
+              "max-md:pointer-coarse:h-10 max-md:pointer-coarse:w-9",
               "text-muted-foreground transition-colors hover:bg-state-hover hover:text-foreground",
               "disabled:pointer-events-none disabled:opacity-50",
               busy && "prompt-enhancer-pill-busy"
@@ -6550,7 +6551,10 @@ function EnhanceButton() {
               Icon,
               {
                 name: busy ? cancelHover ? "X" : "Loading" : "AiContentGenerator01",
-                className: cn("size-4", busy && !cancelHover && "animate-spin"),
+                className: cn(
+                  "size-4 max-md:pointer-coarse:size-5",
+                  busy && !cancelHover && "animate-spin"
+                ),
                 "aria-hidden": true
               }
             )
