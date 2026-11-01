@@ -406,6 +406,8 @@ export default async function plugin(bb: BbPluginApi) {
   const producedOutput = new Set<string>();
   /** The first spawn plus retries; the last one may switch provider. */
   const MAX_START_ATTEMPTS = 3;
+  /** bb's system error when a thread's provider fails to start. */
+  const START_FAILURE_MESSAGE = "Command thread.start failed";
 
   function forgetSpawnPlan(id: string): void {
     spawnPlans.delete(id);
@@ -482,18 +484,23 @@ export default async function plugin(bb: BbPluginApi) {
    * start a fresh one; otherwise the run fails with the child's error.
    */
   function childFailed(id: string, childThreadId: string, message: string): void {
-    stopProgress(id);
     cleanupChildThread(childThreadId);
     const row = byId.get(id) as EnhancementRow | undefined;
     // The poller and thread.failed can both report the same child; only the
-    // first report for the run's current child acts.
+    // first report for the run's current child acts. A late report about a
+    // replaced child must not stop the poller of the child that replaced it.
     if (row === undefined || row.status !== "pending" || row.child_thread_id !== childThreadId) {
       return;
     }
+    stopProgress(id);
     const plan = spawnPlans.get(id);
     if (
       disposed ||
       plan === undefined ||
+      // Only a provider that never came up is worth another try. A rate
+      // limit or an auth error would fail the same way again, and the user
+      // needs to see it now.
+      message !== START_FAILURE_MESSAGE ||
       producedOutput.has(id) ||
       plan.attempts >= MAX_START_ATTEMPTS
     ) {
@@ -635,8 +642,9 @@ export default async function plugin(bb: BbPluginApi) {
         }
       } catch {
         // Stale handle or the child is gone — either way stop polling;
-        // the lifecycle events still resolve the enhancement.
-        stopProgress(id);
+        // the lifecycle events still resolve the enhancement. A poller that
+        // was already replaced by a retry must leave the new one running.
+        if (!isStopped()) stopProgress(id);
       }
     }, PROGRESS_POLL_MS);
     progressTimers.set(id, timer);
