@@ -380,6 +380,145 @@ export default async function plugin(bb: BbPluginApi) {
   function fail(id: string, message: string) {
     markError.run(message, id);
     publish(id, "error");
+    forgetSpawnPlan(id);
+  }
+
+  /**
+   * What it takes to (re)spawn an enhancement's child thread. A child can die
+   * before it writes a word — a provider that does not come up in time ("pi
+   * did not answer get_state in time" reaches us as "Command thread.start
+   * failed") — and that says nothing about the prompt, so such a run starts a
+   * fresh child instead of failing. In memory only: a run interrupted by a
+   * reload resolves through the orphan path below, as before.
+   */
+  type SpawnPlan = {
+    projectId: string;
+    prompt: string;
+    override: ModelOverride | null;
+    inheritedProviderId: string | undefined;
+    attempts: number;
+    /** Providers whose child failed to start, so the fallback skips them. */
+    failedProviders: Set<string>;
+    lastProviderId: string | null;
+  };
+  const spawnPlans = new Map<string, SpawnPlan>();
+  /** Runs whose child has written output: a failure after that is real. */
+  const producedOutput = new Set<string>();
+  /** The first spawn plus retries; the last one may switch provider. */
+  const MAX_START_ATTEMPTS = 3;
+  /** bb's system error when a thread's provider fails to start. */
+  const START_FAILURE_MESSAGE = "Command thread.start failed";
+
+  function forgetSpawnPlan(id: string): void {
+    spawnPlans.delete(id);
+    producedOutput.delete(id);
+  }
+
+  /** The first catalog provider not in `exclude`, or null. Never throws. */
+  async function pickFallbackProvider(
+    exclude: ReadonlySet<string>,
+  ): Promise<string | null> {
+    try {
+      const catalog = await withTimeout(
+        loadModelCatalog(),
+        PROVIDER_CALL_TIMEOUT_MS,
+        "model catalog",
+      );
+      return catalog.providers.find((provider) => !exclude.has(provider.id))?.id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function spawnChild(id: string, plan: SpawnPlan): Promise<void> {
+    plan.attempts += 1;
+    // The last attempt moves off a provider that already failed to start —
+    // unless the user picked the model themselves: that choice is kept.
+    const fallbackProviderId =
+      plan.override === null && plan.attempts === MAX_START_ATTEMPTS
+        ? await pickFallbackProvider(plan.failedProviders)
+        : null;
+    const child = await bb.sdk.threads.spawn({
+      projectId: plan.projectId,
+      environment: { type: "project-default" },
+      // An explicit override wins. Otherwise inherit the scope thread's
+      // provider (model stays at that provider's default); on the
+      // new-thread composer omit both so spawn uses the project default.
+      ...(fallbackProviderId
+        ? { providerId: fallbackProviderId }
+        : plan.override
+          ? {
+              providerId: plan.override.providerId,
+              model: plan.override.model,
+              // Omitted → the model's own default reasoning level.
+              ...(plan.override.reasoningLevel
+                ? { reasoningLevel: plan.override.reasoningLevel }
+                : {}),
+            }
+          : plan.inheritedProviderId
+            ? { providerId: plan.inheritedProviderId }
+            : {}),
+      // Deliberately NOT parented to the scope thread: a hidden child
+      // reports its completion to its parent, which would inject the
+      // rewritten prompt into that thread's conversation. The rewrite
+      // belongs in the composer draft, never the timeline.
+      visibility: "hidden",
+      title: "Enhance prompt",
+      prompt: plan.prompt,
+    });
+    plan.lastProviderId = child.providerId ?? null;
+    setChildThread.run(child.id, id);
+    // The user may have cancelled while spawn was in flight; the child is
+    // already running, so reap it here instead of leaking it.
+    const row = byId.get(id) as EnhancementRow | undefined;
+    if (row === undefined || row.status !== "pending") {
+      cleanupChildThread(child.id);
+      forgetSpawnPlan(id);
+    } else {
+      startProgress(id, child.id);
+    }
+  }
+
+  /**
+   * A child thread failed. If it never wrote anything and attempts remain,
+   * start a fresh one; otherwise the run fails with the child's error.
+   */
+  function childFailed(id: string, childThreadId: string, message: string): void {
+    cleanupChildThread(childThreadId);
+    const row = byId.get(id) as EnhancementRow | undefined;
+    // The poller and thread.failed can both report the same child; only the
+    // first report for the run's current child acts. A late report about a
+    // replaced child must not stop the poller of the child that replaced it.
+    if (row === undefined || row.status !== "pending" || row.child_thread_id !== childThreadId) {
+      return;
+    }
+    stopProgress(id);
+    const plan = spawnPlans.get(id);
+    if (
+      disposed ||
+      plan === undefined ||
+      // Only a provider that never came up is worth another try. A rate
+      // limit or an auth error would fail the same way again, and the user
+      // needs to see it now.
+      message !== START_FAILURE_MESSAGE ||
+      producedOutput.has(id) ||
+      plan.attempts >= MAX_START_ATTEMPTS
+    ) {
+      fail(id, message);
+      return;
+    }
+    if (plan.lastProviderId !== null) plan.failedProviders.add(plan.lastProviderId);
+    setChildThread.run(null, id);
+    bb.log.warn(
+      `enhancement ${id}: child ${childThreadId} failed before writing (${message}); retrying`,
+    );
+    void spawnChild(id, plan).catch((error: unknown) => {
+      try {
+        fail(id, error instanceof Error ? error.message : String(error));
+      } catch {
+        // Stale handle mid-reload — nothing safe left to do.
+      }
+    });
   }
 
   // ---------------------------------------------------------------------
@@ -421,6 +560,7 @@ export default async function plugin(bb: BbPluginApi) {
       } else {
         markDone.run(enhanced, Date.now() - row.created_at, id);
         publish(id, "done");
+        forgetSpawnPlan(id);
       }
       cleanupChildThread(childThreadId);
     }
@@ -446,6 +586,7 @@ export default async function plugin(bb: BbPluginApi) {
         });
         if (isStopped()) return;
         const text = output ?? "";
+        if (text.length > 0) producedOutput.add(id);
         if (text.length > lastSeen.length) {
           // Monotonic: only growth is relayed, so the composer never sees
           // the text shrink or flicker between event-assembly states.
@@ -473,7 +614,6 @@ export default async function plugin(bb: BbPluginApi) {
         if (child.status === "idle") {
           finalize(row, text);
         } else if (child.status === "error") {
-          stopProgress(id);
           // The child's own error (rate limit, out of credits, provider
           // failure) is what the user needs to see — a generic "failed"
           // sends them digging through a thread that is about to be
@@ -498,13 +638,13 @@ export default async function plugin(bb: BbPluginApi) {
           } catch {
             // Keep the generic message.
           }
-          fail(id, message);
-          cleanupChildThread(childThreadId);
+          childFailed(id, childThreadId, message);
         }
       } catch {
         // Stale handle or the child is gone — either way stop polling;
-        // the lifecycle events still resolve the enhancement.
-        stopProgress(id);
+        // the lifecycle events still resolve the enhancement. A poller that
+        // was already replaced by a retry must leave the new one running.
+        if (!isStopped()) stopProgress(id);
       }
     }, PROGRESS_POLL_MS);
     progressTimers.set(id, timer);
@@ -704,30 +844,8 @@ export default async function plugin(bb: BbPluginApi) {
       const customRaw = (settingsValues.customInstructions ?? "").trim();
       // The builder caps the length itself; only presence matters here.
       const customInstructions = customRaw.length > 0 ? customRaw : null;
-      const child = await bb.sdk.threads.spawn({
+      const plan: SpawnPlan = {
         projectId: resolvedProjectId,
-        environment: { type: "project-default" },
-        // An explicit override wins. Otherwise inherit the scope thread's
-        // provider (model stays at that provider's default); on the
-        // new-thread composer omit both so spawn uses the project default.
-        ...(override
-          ? {
-              providerId: override.providerId,
-              model: override.model,
-              // Omitted → the model's own default reasoning level.
-              ...(override.reasoningLevel
-                ? { reasoningLevel: override.reasoningLevel }
-                : {}),
-            }
-          : providerId
-            ? { providerId }
-            : {}),
-        // Deliberately NOT parented to the scope thread: a hidden child
-        // reports its completion to its parent, which would inject the
-        // rewritten prompt into that thread's conversation. The rewrite
-        // belongs in the composer draft, never the timeline.
-        visibility: "hidden",
-        title: "Enhance prompt",
         prompt: buildEnhancePrompt(text, {
           kind: threadId === null ? "new-task" : "follow-up",
           attachmentCount,
@@ -735,16 +853,14 @@ export default async function plugin(bb: BbPluginApi) {
           lastOutput,
           customInstructions,
         }),
-      });
-      setChildThread.run(child.id, id);
-      // The user may have cancelled while spawn was in flight; the child is
-      // already running, so reap it here instead of leaking it.
-      const row = byId.get(id) as EnhancementRow | undefined;
-      if (row === undefined || row.status !== "pending") {
-        cleanupChildThread(child.id);
-      } else {
-        startProgress(id, child.id);
-      }
+        override,
+        inheritedProviderId: providerId,
+        attempts: 0,
+        failedProviders: new Set(),
+        lastProviderId: null,
+      };
+      spawnPlans.set(id, plan);
+      await spawnChild(id, plan);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       try {
@@ -828,6 +944,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (row === undefined || row.status !== "pending") return {};
       markCancelled.run(id);
       stopProgress(id);
+      forgetSpawnPlan(id);
       cleanupChildThread(row.child_thread_id);
       return {};
     },
@@ -889,6 +1006,7 @@ export default async function plugin(bb: BbPluginApi) {
     } else {
       markDone.run(enhanced, Date.now() - row.created_at, row.id);
       publish(row.id, "done");
+      forgetSpawnPlan(row.id);
     }
     cleanupChildThread(thread.id);
   });
@@ -896,8 +1014,6 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("thread.failed", ({ thread, error }) => {
     const row = pendingByChild.get(thread.id) as EnhancementRow | undefined;
     if (!row) return;
-    stopProgress(row.id);
-    fail(row.id, error ?? "The enhancement thread failed");
-    cleanupChildThread(thread.id);
+    childFailed(row.id, thread.id, error ?? "The enhancement thread failed");
   });
 }
