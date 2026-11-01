@@ -19,7 +19,7 @@ bb plugin install git:https://github.com/vburojevic/bb-plugin-prompt-enhancer.gi
 ```
 
 `bb` git installs take an explicit ref, so pin a release instead if you prefer:
-`…bb-plugin-prompt-enhancer.git@v0.2.4`.
+`…bb-plugin-prompt-enhancer.git@v0.2.6`.
 
 Then click the spark in any composer — or press **⌘E** (**Ctrl+E** on
 Windows and Linux) while the composer is focused.
