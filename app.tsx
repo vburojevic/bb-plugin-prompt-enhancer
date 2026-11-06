@@ -15,6 +15,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   definePluginApp,
+  type ComposerDraft,
   useComposer,
   useComposerView,
   useRealtime,
@@ -51,6 +52,7 @@ import {
 } from "@/lib/references";
 import { scopeKey as scopeKeyOf } from "@/lib/scope-key";
 import { nextShown, REVEAL_TICK_MS } from "@/lib/reveal";
+import { reanchorMentions } from "@/lib/mentions";
 
 const isMac = navigator.platform.toUpperCase().includes("MAC");
 const SHORTCUT_HINT = isMac ? "⌘E" : "Ctrl+E";
@@ -126,6 +128,8 @@ function scopeKey(scope: ComposerScope): string {
 interface PendingRun {
   id: string;
   originalText: string;
+  /** The draft's @-mention pills at start, re-anchored on the rewrite. */
+  originalMentions: ComposerDraft["mentions"];
   previewGate: boolean;
   /** Absolute time after which the run is running longer than predicted. */
   deadline: number;
@@ -282,7 +286,8 @@ function EnhanceButton() {
    * thread mid-reveal leaves the run adoptable and it re-types on return.
    */
   const deliveringIdRef = useRef<string | null>(null);
-  const originalTextRef = useRef<string>("");
+  /** The draft as it was when the run started: what Undo and abort restore. */
+  const originalDraftRef = useRef<ComposerDraft>({ text: "", mentions: [] });
   /** Whether the pending enhancement should preview instead of auto-apply. */
   const previewGateRef = useRef(false);
   /** Structured mention labels snapshotted when the pending run started. */
@@ -345,7 +350,7 @@ function EnhanceButton() {
     revealRef.current = null;
     if (!hadReveal) return;
     try {
-      composer.setText(originalTextRef.current);
+      composer.replace(originalDraftRef.current);
     } catch {
       // Composer gone; nothing to restore into.
     }
@@ -353,13 +358,14 @@ function EnhanceButton() {
 
   /** Success toast with a one-tap way back to the pre-rewrite draft. */
   function notifyEnhanced(enhanced: string): void {
-    const original = originalTextRef.current;
+    const originalDraft = originalDraftRef.current;
+    const original = originalDraft.text;
     toast.success("Prompt enhanced", {
       action: {
         label: "Undo",
         onClick: () => {
           try {
-            composer.setText(original);
+            composer.replace(originalDraft);
           } catch {
             // Composer scope is gone; nothing to restore into.
           }
@@ -409,11 +415,22 @@ function EnhanceButton() {
   }
 
   /**
+   * Write rewritten text into the draft with the original @-mention pills
+   * re-anchored on it. A plain-text write would flatten every pill.
+   */
+  function writeRewrite(text: string): void {
+    composer.replace({
+      text,
+      mentions: reanchorMentions(originalDraftRef.current, text),
+    });
+  }
+
+  /**
    * Feed text into the reveal engine. Called with partial output as it
    * arrives and with the final text (done=true); the engine types toward
    * whatever the current target is, easing out as it catches up, so one big
    * block and a trickle of chunks look equally alive. Any failure falls back
-   * to an instant setText — the rewrite must never be lost to an animation.
+   * to an instant write — the rewrite must never be lost to an animation.
    */
   function feedReveal(text: string, done: boolean): void {
     if (done) {
@@ -427,7 +444,7 @@ function EnhanceButton() {
     if (prefersReducedMotion()) {
       // Reduced motion: no typing choreography, content lands instantly.
       try {
-        composer.setText(text);
+        writeRewrite(text);
       } catch {
         // Composer gone mid-flight; the host released lock/effect.
       }
@@ -466,7 +483,7 @@ function EnhanceButton() {
       try {
         if (current.shown < current.target.length) {
           current.shown = nextShown(current.shown, current.target.length);
-          composer.setText(current.target.slice(0, current.shown));
+          writeRewrite(current.target.slice(0, current.shown));
         }
         if (current.done && current.shown >= current.target.length) {
           completeReveal(current.target);
@@ -475,7 +492,7 @@ function EnhanceButton() {
         // The composer went away mid-reveal (scope change/unmount) — land
         // the text if at all possible; never lose it to the animation.
         try {
-          composer.setText(current.target);
+          writeRewrite(current.target);
         } catch {
           // Truly gone.
         }
@@ -507,7 +524,7 @@ function EnhanceButton() {
       // so leaving with the dialog open brings the rewrite back on return.
       clearPending();
       deliveringIdRef.current = null;
-      setPreview({ id, original: originalTextRef.current, enhanced });
+      setPreview({ id, original: originalDraftRef.current.text, enhanced });
       return;
     }
     // The engine finishes typing whatever remains, then settles.
@@ -604,18 +621,23 @@ function EnhanceButton() {
   function adoptRun(run: {
     id: string;
     originalText: string;
+    originalMentions: ComposerDraft["mentions"];
     previewGate: boolean;
     deadline: number;
     mentionLabels: readonly string[];
   }): void {
     pendingIdRef.current = run.id;
     previewGateRef.current = run.previewGate;
-    originalTextRef.current = run.originalText;
+    originalDraftRef.current = {
+      text: run.originalText,
+      mentions: run.originalMentions,
+    };
     mentionLabelsRef.current = run.mentionLabels;
     revealRef.current = null;
     pendingRuns.set(myScopeKey, {
       id: run.id,
       originalText: run.originalText,
+      originalMentions: run.originalMentions,
       previewGate: run.previewGate,
       deadline: run.deadline,
       mentionLabels: run.mentionLabels,
@@ -650,7 +672,17 @@ function EnhanceButton() {
         // A newer run started elsewhere (another window) wins over the cached
         // one; the same run just refreshes the state adopted above.
         if (pendingIdRef.current !== run.id || cached === undefined) {
-          adoptRun(run);
+          // The server keeps only the text. The pills come from this window's
+          // cache, or from the draft itself while it still holds the original
+          // (it is locked for the whole run).
+          const draft = composer.draft;
+          const originalMentions =
+            cached?.id === run.id
+              ? cached.originalMentions
+              : draft.text === run.originalText
+                ? draft.mentions
+                : [];
+          adoptRun({ ...run, originalMentions });
         }
         if (run.status === "done" && run.enhanced) {
           resolveDone(run.id, run.enhanced);
@@ -695,7 +727,7 @@ function EnhanceButton() {
       .then((prefs) => prefs.previewBeforeApply)
       .catch(() => false);
     const mentionLabels = mentionLabelsByScope.get(myScopeKey) ?? [];
-    const originalText = composer.text;
+    const { text: originalText, mentions: originalMentions } = composer.draft;
     let id: string;
     let timeoutMs = FALLBACK_TIMEOUT_MS;
     try {
@@ -719,6 +751,7 @@ function EnhanceButton() {
     adoptRun({
       id,
       originalText,
+      originalMentions,
       previewGate: previewGateRef.current,
       deadline: Date.now() + timeoutMs,
       mentionLabels,
@@ -740,7 +773,7 @@ function EnhanceButton() {
     setPreview(null);
     ackRun(id);
     try {
-      composer.setText(enhanced);
+      writeRewrite(enhanced);
       composer.setTextEffect({ className: "prompt-enhancer-settle" });
       composer.focus();
     } catch {

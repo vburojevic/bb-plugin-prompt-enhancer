@@ -393,6 +393,7 @@ export default async function plugin(bb: BbPluginApi) {
    */
   type SpawnPlan = {
     projectId: string;
+    environment: SpawnEnvironment;
     prompt: string;
     override: ModelOverride | null;
     inheritedProviderId: string | undefined;
@@ -401,6 +402,7 @@ export default async function plugin(bb: BbPluginApi) {
     failedProviders: Set<string>;
     lastProviderId: string | null;
   };
+  type SpawnEnvironment = Parameters<typeof bb.sdk.threads.spawn>[0]["environment"];
   const spawnPlans = new Map<string, SpawnPlan>();
   /** Runs whose child has written output: a failure after that is real. */
   const producedOutput = new Set<string>();
@@ -440,7 +442,7 @@ export default async function plugin(bb: BbPluginApi) {
         : null;
     const child = await bb.sdk.threads.spawn({
       projectId: plan.projectId,
-      environment: { type: "project-default" },
+      environment: plan.environment,
       // An explicit override wins. Otherwise inherit the scope thread's
       // provider (model stays at that provider's default); on the
       // new-thread composer omit both so spawn uses the project default.
@@ -805,12 +807,14 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<void> {
     try {
       let resolvedProjectId = projectId;
+      let scopeEnvironmentId: string | null = null;
       let providerId: string | undefined;
       let threadTitle: string | null = null;
       let lastOutput: string | null = null;
       if (threadId !== null) {
         const parent = await bb.sdk.threads.get({ threadId });
         resolvedProjectId = parent.projectId;
+        scopeEnvironmentId = parent.environmentId;
         providerId = parent.providerId;
         threadTitle = parent.title ?? null;
         // Context is best-effort: a rewrite without it is still correct, so
@@ -828,11 +832,35 @@ export default async function plugin(bb: BbPluginApi) {
           // Proceed without conversation context.
         }
       }
-      if (resolvedProjectId === null) {
-        // New-thread composer with an unresolved project: fall back to the
-        // first ordinary project so spawn still has a home.
+      let environment: SpawnEnvironment;
+      if (scopeEnvironmentId !== null) {
+        // Run in the scope thread's own workspace. "project-default" would
+        // provision a fresh git worktree (and branch) for every click in a
+        // git project, only to throw it away seconds later.
+        environment = { type: "reuse", environmentId: scopeEnvironmentId };
+      } else {
+        // New-thread composer (or a scope thread without a workspace yet):
+        // attach to the project's own checkout, which creates no worktree,
+        // branch or directory. Projects without a checkout (the personal
+        // project) keep bb's default.
         const projects = await bb.sdk.projects.list();
-        resolvedProjectId = projects[0]?.id ?? null;
+        // An unresolved project falls back to the first ordinary project so
+        // spawn still has a home.
+        const project =
+          resolvedProjectId === null
+            ? projects[0]
+            : projects.find((candidate) => candidate.id === resolvedProjectId);
+        resolvedProjectId = project?.id ?? resolvedProjectId;
+        const source =
+          project?.sources.find((candidate) => candidate.isDefault) ??
+          project?.sources[0];
+        environment = source
+          ? {
+              type: "host",
+              hostId: source.hostId,
+              workspace: { type: "unmanaged", path: null },
+            }
+          : { type: "project-default" };
       }
       if (resolvedProjectId === null) {
         throw new Error("No project available to run the enhancement in");
@@ -846,6 +874,7 @@ export default async function plugin(bb: BbPluginApi) {
       const customInstructions = customRaw.length > 0 ? customRaw : null;
       const plan: SpawnPlan = {
         projectId: resolvedProjectId,
+        environment,
         prompt: buildEnhancePrompt(text, {
           kind: threadId === null ? "new-task" : "follow-up",
           attachmentCount,
