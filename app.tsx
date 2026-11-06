@@ -793,15 +793,15 @@ function EnhanceButton() {
       className="flex items-center"
     >
       {/* Same idiom as the Prompts plugin's composer button, so the row
-          reads as one family: bordered 28px pill, muted-to-foreground on
-          hover, size-4 icon. On a coarse pointer it grows to 36x40 — the
+          reads as one family: borderless 28px ghost button like bb's own
+          composer controls, muted-to-foreground on hover, size-4 icon. On a coarse pointer it grows to 36x40 — the
           size BB's own composer actions (expand, prompt actions, voice)
           take there, so the row stays one family on touch too instead of
           leaving this the one 28px target among 40px neighbours. */}
       <button
         type="button"
         className={cn(
-          "flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-input",
+          "flex h-7 w-7 shrink-0 items-center justify-center rounded-md",
           "max-md:pointer-coarse:h-10 max-md:pointer-coarse:w-9",
           "text-muted-foreground transition-colors hover:bg-state-hover hover:text-foreground",
           "disabled:pointer-events-none disabled:opacity-50",
