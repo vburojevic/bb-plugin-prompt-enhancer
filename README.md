@@ -122,7 +122,7 @@ flowchart LR
 
 The hidden thread runs in the workspace you are drafting in: the thread's own environment, or the project's checkout in the new-thread composer. It may read files to resolve what the draft refers to, but it is told never to edit files, run commands or carry out the draft. It creates no worktree and no branch, and it is stopped and deleted the moment it resolves, so nothing piles up in your thread list or your repository.
 
-## Review before applying, and choose the model
+## Review before applying
 
 <table>
 <tr>
@@ -133,27 +133,27 @@ The hidden thread runs in the workspace you are drafting in: the thread's own en
   <img src="assets/screenshots/review.png" width="100%" alt="The Review enhanced prompt dialog showing the original and enhanced text with Discard and Apply buttons">
 </picture>
 
-### Review before applying
+</td>
+<td width="50%" valign="top">
 
 Prefer to look before it touches your draft? Turn on **Review before applying** and every rewrite arrives in an Apply/Discard preview showing both versions, with the dropped-reference warning inline if there is one.
 
+On a phone the preview opens as a bottom sheet.
+
 </td>
-<td width="50%" valign="top">
+</tr>
+</table>
+
+## Choose what rewrites your drafts
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/settings-dark.png">
   <img src="assets/screenshots/settings.png" width="100%" alt="The Prompt Enhancer settings: Review before applying, Custom rewrite instructions, and the Enhancer model picker with its reasoning levels">
 </picture>
 
-### Choose what rewrites your drafts
-
 By default the rewrite runs on the provider of the thread you are drafting in (or the project default in the new-thread composer), at that provider's default model.
 
 Pin something else under **Settings → Prompt Enhancer**. Picking a model shows its reasoning levels in their own group, the same progressive disclosure bb's own model picker uses. It lives in settings rather than beside the draft because it is a set-once preference: the composer keeps a single button.
-
-</td>
-</tr>
-</table>
 
 **Custom rewrite instructions** appends a standing instruction to every rewrite: `keep prompts under 100 words`, `always write in German`, whatever you keep asking for.
 
