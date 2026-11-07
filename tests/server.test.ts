@@ -37,6 +37,8 @@ async function setup() {
             projectId: "proj_1",
             environmentId: "env_1",
             providerId: "claude-code",
+            // A fresh child is at work; the fixture's default is idle.
+            status: threadId.startsWith(CHILD) ? "active" : "idle",
           }),
         output: async ({ threadId }: { threadId: string }) => ({
           output: threadId === CHILD ? child.output : "earlier reply",
@@ -147,6 +149,29 @@ test("a child that fails without an error message reports its last error event",
     error: null,
   });
   const run = await settled(id, 1_000);
+  assert.equal(run.status, "error");
+  assert.equal(run.error, "Rate limited");
+});
+
+test("a child that ended before its watch began still resolves the run", async () => {
+  const { harness, start, settled } = await setup();
+  // The child failed before the plugin had the spawn reply, so its
+  // thread.failed found no run; only its status tells.
+  harness.inspection.sdk.stub("threads.get", async ({ threadId }: { threadId: string }) =>
+    makeThreadResponse({
+      id: threadId,
+      projectId: "proj_1",
+      environmentId: "env_1",
+      providerId: "claude-code",
+      status: threadId === CHILD ? "error" : "idle",
+    }),
+  );
+  harness.inspection.sdk.stub("threads.events.list", async () => [
+    { type: "provider/error", data: { message: "Rate limited" } },
+  ]);
+  const id = await start();
+  const run = await settled(id, 1_000);
+  assert.equal(harness.inspection.sdk.callsTo("threads.spawn").length, 1);
   assert.equal(run.status, "error");
   assert.equal(run.error, "Rate limited");
 });

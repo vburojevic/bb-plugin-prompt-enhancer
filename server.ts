@@ -615,6 +615,25 @@ export default async function plugin(bb: BbPluginApi) {
     // Output written before this watch existed (a reattached orphan, or
     // events that beat the spawn reply) has no announcement left to come.
     void readProgress(id, watch);
+    // Nor does an end that beat it: thread.idle or thread.failed found no
+    // row for this child yet, so ask once where it stands.
+    void (async () => {
+      try {
+        const child = await bb.sdk.threads.get({ threadId: childThreadId });
+        if (watches.get(id) !== watch) return;
+        if (child.status === "idle") {
+          const { output } = await bb.sdk.threads.output({ threadId: childThreadId });
+          finalize(id, childThreadId, output ?? "");
+        } else if (child.status === "error") {
+          stopProgress(id);
+          const message = await lastErrorMessage(childThreadId);
+          if (disposed) return;
+          childFailed(id, childThreadId, message ?? "The enhancement thread failed");
+        }
+      } catch {
+        // Unreachable child: the events and the cap timer still resolve it.
+      }
+    })();
   }
 
   /**
