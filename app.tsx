@@ -672,17 +672,22 @@ function EnhanceButton() {
         // A newer run started elsewhere (another window) wins over the cached
         // one; the same run just refreshes the state adopted above.
         if (pendingIdRef.current !== run.id || cached === undefined) {
-          // The server keeps only the text. The pills come from this window's
-          // cache, or from the draft itself while it still holds the original
-          // (it is locked for the whole run).
+          // The server keeps only the trimmed text. The pills come from this
+          // window's cache, or from the draft itself while it still holds the
+          // original (it is locked for the whole run). The draft's own text
+          // goes with them: their offsets index into it, whitespace included.
           const draft = composer.draft;
-          const originalMentions =
+          const original =
             cached?.id === run.id
-              ? cached.originalMentions
-              : draft.text === run.originalText
-                ? draft.mentions
-                : [];
-          adoptRun({ ...run, originalMentions });
+              ? { text: cached.originalText, mentions: cached.originalMentions }
+              : draft.text.trim() === run.originalText
+                ? { text: draft.text, mentions: draft.mentions }
+                : { text: run.originalText, mentions: [] };
+          adoptRun({
+            ...run,
+            originalText: original.text,
+            originalMentions: original.mentions,
+          });
         }
         if (run.status === "done" && run.enhanced) {
           resolveDone(run.id, run.enhanced);

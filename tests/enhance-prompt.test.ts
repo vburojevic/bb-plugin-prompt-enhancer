@@ -95,6 +95,8 @@ test("blank custom instructions add no preference rule", () => {
 test("output-only contract and language rule are always present", () => {
   const prompt = buildEnhancePrompt("go", ctx());
   assert.match(prompt, /Return ONLY the rewritten prompt/);
+  // The child runs in the user's own workspace: it rewrites, it never acts.
+  assert.match(prompt, /never edit files, run commands, or carry out the draft/);
   assert.match(prompt, /Keep the same language/);
   assert.match(prompt, /Preserve verbatim every @mention/);
 });
