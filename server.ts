@@ -409,6 +409,9 @@ export default async function plugin(bb: BbPluginApi) {
   const MAX_START_ATTEMPTS = 3;
   /** bb's system error when a thread's provider fails to start. */
   const START_FAILURE_MESSAGE = "Command thread.start failed";
+  /** A failure cause longer than this is cut, so the error stays readable. */
+  const FAILURE_DETAIL_CAP = 300;
+  type ChildFailure = { message: string; detail: string | null };
 
   function forgetSpawnPlan(id: string): void {
     spawnPlans.delete(id);
@@ -480,25 +483,52 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  /** The message of the child's latest error event, or null. Never throws. */
-  async function lastErrorMessage(childThreadId: string): Promise<string | null> {
+  /**
+   * Why a child failed, from its latest error event. bb's `message` is often
+   * a category ("Command thread.start failed", "Provider error") and the
+   * cause is in `detail` ("pi did not answer get_state in time", "There's an
+   * issue with the selected model"). Never throws.
+   */
+  async function readChildFailure(
+    childThreadId: string,
+    reported: string | null,
+  ): Promise<ChildFailure> {
+    const fallback = reported ?? "The enhancement thread failed";
     try {
       const events = await bb.sdk.threads.events.list({ threadId: childThreadId });
       const lastError = [...events].reverse().find((event) => event.type.includes("error"));
-      if (lastError === undefined) return null;
-      const data = lastError.data as { message?: unknown; text?: unknown };
-      const message = typeof data.message === "string" ? data.message : data.text;
-      return typeof message === "string" && message.length > 0 ? message : null;
+      if (lastError === undefined) return { message: fallback, detail: null };
+      const data = lastError.data as { message?: unknown; text?: unknown; detail?: unknown };
+      const message = [data.message, data.text].find(
+        (value): value is string => typeof value === "string" && value.trim().length > 0,
+      );
+      const detail =
+        typeof data.detail === "string" && data.detail.trim().length > 0
+          ? data.detail.trim()
+          : null;
+      return { message: message ?? fallback, detail };
     } catch {
-      return null;
+      return { message: fallback, detail: null };
     }
+  }
+
+  /** The text the composer shows for a failed child: the cause when known. */
+  function describeFailure(failure: ChildFailure): string {
+    if (failure.detail === null) return failure.message;
+    const detail =
+      failure.detail.length > FAILURE_DETAIL_CAP
+        ? `${failure.detail.slice(0, FAILURE_DETAIL_CAP - 1)}…`
+        : failure.detail;
+    return failure.message === START_FAILURE_MESSAGE
+      ? `The provider did not start: ${detail}`
+      : detail;
   }
 
   /**
    * A child thread failed. If it never wrote anything and attempts remain,
    * start a fresh one; otherwise the run fails with the child's error.
    */
-  function childFailed(id: string, childThreadId: string, message: string): void {
+  function childFailed(id: string, childThreadId: string, failure: ChildFailure): void {
     cleanupChildThread(childThreadId);
     const row = byId.get(id) as EnhancementRow | undefined;
     // Only the first report for the run's current child acts. A late report
@@ -515,17 +545,17 @@ export default async function plugin(bb: BbPluginApi) {
       // Only a provider that never came up is worth another try. A rate
       // limit or an auth error would fail the same way again, and the user
       // needs to see it now.
-      message !== START_FAILURE_MESSAGE ||
+      failure.message !== START_FAILURE_MESSAGE ||
       producedOutput.has(id) ||
       plan.attempts >= MAX_START_ATTEMPTS
     ) {
-      fail(id, message);
+      fail(id, describeFailure(failure));
       return;
     }
     if (plan.lastProviderId !== null) plan.failedProviders.add(plan.lastProviderId);
     setChildThread.run(null, id);
     bb.log.warn(
-      `enhancement ${id}: child ${childThreadId} failed before writing (${message}); retrying`,
+      `enhancement ${id}: child ${childThreadId} failed before writing (${describeFailure(failure)}); retrying`,
     );
     void spawnChild(id, plan).catch((error: unknown) => {
       try {
@@ -626,9 +656,9 @@ export default async function plugin(bb: BbPluginApi) {
           finalize(id, childThreadId, output ?? "");
         } else if (child.status === "error") {
           stopProgress(id);
-          const message = await lastErrorMessage(childThreadId);
+          const failure = await readChildFailure(childThreadId, null);
           if (disposed) return;
-          childFailed(id, childThreadId, message ?? "The enhancement thread failed");
+          childFailed(id, childThreadId, failure);
         }
       } catch {
         // Unreachable child: the events and the cap timer still resolve it.
@@ -721,7 +751,10 @@ export default async function plugin(bb: BbPluginApi) {
           threadId: orphan.child_thread_id,
         });
         if (child.status === "error") {
-          fail(orphan.id, "The enhancement thread failed");
+          // Failed while we were down: its thread.failed is not replayed, so
+          // read why from the child before it is deleted.
+          const failure = await readChildFailure(orphan.child_thread_id, null);
+          fail(orphan.id, describeFailure(failure));
           cleanupChildThread(orphan.child_thread_id);
           continue;
         }
@@ -1093,9 +1126,9 @@ export default async function plugin(bb: BbPluginApi) {
       // The child's own error (rate limit, out of credits, provider failure)
       // is what the user needs to see — a generic "failed" sends them digging
       // through a thread that is about to be deleted.
-      const message = error ?? (await lastErrorMessage(thread.id));
+      const failure = await readChildFailure(thread.id, error);
       if (disposed) return;
-      childFailed(row.id, thread.id, message ?? "The enhancement thread failed");
+      childFailed(row.id, thread.id, failure);
     } catch {
       // Stale handle mid-reload — nothing safe left to do.
     }

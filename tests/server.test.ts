@@ -24,7 +24,7 @@ async function waitFor(check: () => boolean, label: string): Promise<void> {
 
 /** A loaded plugin with one scope thread and a child whose output we control. */
 async function setup() {
-  const child = { output: null as string | null };
+  const child = { output: null as string | null, spawned: 0 };
   const { bb, harness } = createFakePluginHost({
     pluginId: "prompt-enhancer",
     sdk: {
@@ -41,10 +41,17 @@ async function setup() {
             status: threadId.startsWith(CHILD) ? "active" : "idle",
           }),
         output: async ({ threadId }: { threadId: string }) => ({
-          output: threadId === CHILD ? child.output : "earlier reply",
+          output: threadId.startsWith(CHILD) ? child.output : "earlier reply",
         }),
-        spawn: async () =>
-          makeThreadResponse({ id: CHILD, projectId: "proj_1", providerId: "claude-code" }),
+        // Each spawn is a fresh child: thr_child, thr_child-2, thr_child-3.
+        spawn: async () => {
+          child.spawned += 1;
+          return makeThreadResponse({
+            id: child.spawned === 1 ? CHILD : `${CHILD}-${child.spawned}`,
+            projectId: "proj_1",
+            providerId: "claude-code",
+          });
+        },
         stop: async () => ({}),
         delete: async () => ({}),
         events: { list: async () => [] },
@@ -55,7 +62,7 @@ async function setup() {
   const childOutputReads = () =>
     harness.inspection.sdk
       .callsTo("threads.output")
-      .filter(([args]) => (args as { threadId: string }).threadId === CHILD).length;
+      .filter(([args]) => (args as { threadId: string }).threadId.startsWith(CHILD)).length;
   const signals = () =>
     harness.inspection.realtimeSignals.map(
       (signal) => signal.payload as { id: string; status: string; text?: string },
@@ -174,4 +181,61 @@ test("a child that ended before its watch began still resolves the run", async (
   assert.equal(harness.inspection.sdk.callsTo("threads.spawn").length, 1);
   assert.equal(run.status, "error");
   assert.equal(run.error, "Rate limited");
+});
+
+/** bb's own error event for a provider that never came up. */
+const startFailure = {
+  type: "system/error",
+  data: {
+    code: "thread_command_failed",
+    message: "Command thread.start failed",
+    detail: "pi did not answer get_state in time",
+  },
+};
+
+test("a provider that never starts shows bb's cause, after the retries", async () => {
+  const { harness, child, start, settled } = await setup();
+  harness.inspection.sdk.stub("threads.events.list", async () => [startFailure]);
+  const id = await start();
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    await waitFor(() => child.spawned === attempt, `spawn ${attempt}`);
+    await harness.behavior.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({
+        id: attempt === 1 ? CHILD : `${CHILD}-${attempt}`,
+        projectId: "proj_1",
+        status: "error",
+      }),
+      error: "Command thread.start failed",
+    });
+  }
+  const run = await settled(id, 1_000);
+  assert.equal(child.spawned, 3);
+  assert.equal(run.status, "error");
+  assert.equal(run.error, "The provider did not start: pi did not answer get_state in time");
+});
+
+test("a provider error shows its detail and is not retried", async () => {
+  const { harness, child, start, settled } = await setup();
+  harness.inspection.sdk.stub("threads.events.list", async () => [
+    {
+      type: "provider/error",
+      data: {
+        message: "Provider error",
+        detail:
+          "There's an issue with the selected model (claude-bogus-1). It may not exist or you may not have access to it.",
+      },
+    },
+  ]);
+  const id = await start();
+  await harness.behavior.emitThreadEvent("thread.failed", {
+    thread: makeThreadResponse({ id: CHILD, projectId: "proj_1", status: "error" }),
+    error: "Provider error",
+  });
+  const run = await settled(id, 1_000);
+  assert.equal(child.spawned, 1);
+  assert.equal(run.status, "error");
+  assert.equal(
+    run.error,
+    "There's an issue with the selected model (claude-bogus-1). It may not exist or you may not have access to it.",
+  );
 });
