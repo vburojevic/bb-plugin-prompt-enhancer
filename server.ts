@@ -322,6 +322,8 @@ export default async function plugin(bb: BbPluginApi) {
   const orphans = db
     .prepare(`SELECT * FROM enhancements WHERE status = 'pending'`)
     .all() as EnhancementRow[];
+  /** A retry that moved to another provider learns under that provider's key. */
+  const setModelKey = db.prepare(`UPDATE enhancements SET model_key = ? WHERE id = ?`);
   const setChildThread = db.prepare(
     `UPDATE enhancements SET child_thread_id = ? WHERE id = ?`,
   );
@@ -401,6 +403,8 @@ export default async function plugin(bb: BbPluginApi) {
     /** Providers whose child failed to start, so the fallback skips them. */
     failedProviders: Set<string>;
     lastProviderId: string | null;
+    /** When the current child was spawned; a retried run is timed from it. */
+    childStartedAt: number;
   };
   type SpawnEnvironment = Parameters<typeof bb.sdk.threads.spawn>[0]["environment"];
   const spawnPlans = new Map<string, SpawnPlan>();
@@ -443,6 +447,8 @@ export default async function plugin(bb: BbPluginApi) {
       plan.override === null && plan.attempts === MAX_START_ATTEMPTS
         ? await pickFallbackProvider(plan.failedProviders)
         : null;
+    if (fallbackProviderId !== null) setModelKey.run(`inherit:${fallbackProviderId}`, id);
+    plan.childStartedAt = Date.now();
     const child = await bb.sdk.threads.spawn({
       projectId: plan.projectId,
       environment: plan.environment,
@@ -616,7 +622,13 @@ export default async function plugin(bb: BbPluginApi) {
     if (enhanced.length === 0) {
       fail(id, "The enhancement thread returned an empty response");
     } else {
-      markDone.run(enhanced, Date.now() - row.created_at, id);
+      // The duration teaches the adaptive timeout how long one child of
+      // this model takes. A retried run is timed from its last child, so the
+      // children that never started do not inflate the next timeout.
+      const plan = spawnPlans.get(id);
+      const startedAt =
+        plan !== undefined && plan.attempts > 1 ? plan.childStartedAt : row.created_at;
+      markDone.run(enhanced, Date.now() - startedAt, id);
       publish(id, "done");
       forgetSpawnPlan(id);
     }
@@ -982,6 +994,7 @@ export default async function plugin(bb: BbPluginApi) {
         override,
         inheritedProviderId: providerId,
         attempts: 0,
+        childStartedAt: Date.now(),
         failedProviders: new Set(),
         lastProviderId: null,
       };

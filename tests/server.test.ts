@@ -15,9 +15,10 @@ const CHILD = "thr_child";
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function waitFor(check: () => boolean, label: string): Promise<void> {
-  const deadline = Date.now() + 3_000;
+  // performance.now, not Date: some tests freeze Date.
+  const deadline = performance.now() + 3_000;
   while (!check()) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+    if (performance.now() > deadline) throw new Error(`timed out waiting for ${label}`);
     await sleep(5);
   }
 }
@@ -67,8 +68,8 @@ async function setup() {
     harness.inspection.realtimeSignals.map(
       (signal) => signal.payload as { id: string; status: string; text?: string },
     );
-  async function start(): Promise<string> {
-    const { id } = (await harness.behavior.callRpc("startEnhance", {
+  const startRpc = () =>
+    harness.behavior.callRpc("startEnhance", {
       text: "fix the add bug pls",
       scopeKey: `thread/${SCOPE_THREAD}`,
       threadId: SCOPE_THREAD,
@@ -76,14 +77,18 @@ async function setup() {
       attachmentCount: 0,
       previewGate: false,
       mentionLabels: [],
-    })) as { id: string };
-    await waitFor(() => childOutputReads() === 1, "the first read of the child");
+    }) as Promise<{ id: string; timeoutMs: number }>;
+  async function start(): Promise<string> {
+    const readsBefore = childOutputReads();
+    const { id } = (await startRpc()) as { id: string };
+
+    await waitFor(() => childOutputReads() > readsBefore, "the first read of the child");
     return id;
   }
   /** Waits (up to `ms`) for the run to leave pending, then returns it. */
   async function settled(id: string, ms: number) {
-    const deadline = Date.now() + ms;
-    while ((await enhancement(id)).status === "pending" && Date.now() < deadline) {
+    const deadline = performance.now() + ms;
+    while ((await enhancement(id)).status === "pending" && performance.now() < deadline) {
       await sleep(20);
     }
     return enhancement(id);
@@ -99,7 +104,7 @@ async function setup() {
       thread: makeThreadResponse({ id: CHILD, projectId: "proj_1" }),
       sequence: 1,
     });
-  return { harness, child, childOutputReads, signals, start, enhancement, settled, announce };
+  return { harness, child, childOutputReads, signals, start, startRpc, enhancement, settled, announce };
 }
 
 test("reads the child only when bb announces new events, never on a timer", async () => {
@@ -282,4 +287,33 @@ test("the time cap counts from the run's start, not from a retried child's", { t
   const run = await settled(id, 2_000);
   assert.equal(run.status, "error");
   assert.equal(run.error, "The enhancement took too long and was stopped");
+});
+
+test("a retried run teaches the timeout its last child's time, not the failed ones'", { timeout: 15_000 }, async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const { harness, child, start, startRpc, settled } = await setup();
+  harness.inspection.sdk.stub("threads.events.list", async () => [startFailure]);
+  const childId = (n: number) => (n === 1 ? CHILD : `${CHILD}-${n}`);
+  // Three runs whose first child spends 60 s failing to start and whose retry
+  // writes the rewrite in 5 s: the adaptive timeout needs three samples.
+  for (let run = 0; run < 3; run += 1) {
+    const id = await start();
+    t.mock.timers.setTime(Date.now() + 60_000);
+    const retry = child.spawned + 1;
+    await harness.behavior.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: childId(child.spawned), projectId: "proj_1", status: "error" }),
+      error: "Command thread.start failed",
+    });
+    await waitFor(() => child.spawned === retry, "the retry");
+    t.mock.timers.setTime(Date.now() + 5_000);
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: childId(retry), projectId: "proj_1" }),
+      lastAssistantText: "Rewritten prompt.",
+    });
+    assert.equal((await settled(id, 1_000)).status, "done");
+  }
+  // 5 s runs give the 20 s floor; timing from the click (65 s) would give 138 s.
+  const next = await startRpc();
+  await harness.behavior.callRpc("cancelEnhance", { id: next.id });
+  assert.equal(next.timeoutMs, 20_000);
 });
