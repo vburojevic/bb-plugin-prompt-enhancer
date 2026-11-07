@@ -239,3 +239,27 @@ test("a provider error shows its detail and is not retried", async () => {
     "There's an issue with the selected model (claude-bogus-1). It may not exist or you may not have access to it.",
   );
 });
+
+test("a child that streamed a long rewrite before failing still shows the cause", async () => {
+  const { harness, start, settled } = await setup();
+  // Like bb: oldest first by default, newest first on request, 100 a page.
+  const events = [
+    ...Array.from({ length: 120 }, (_, seq) => ({
+      type: "item/agentMessage/delta",
+      data: { delta: `chunk ${seq}` },
+    })),
+    { type: "provider/error", data: { message: "Provider error", detail: "Rate limit reached" } },
+  ];
+  harness.inspection.sdk.stub(
+    "threads.events.list",
+    async ({ order, limit }: { order?: "asc" | "desc"; limit?: string }) =>
+      (order === "desc" ? [...events].reverse() : events).slice(0, Number(limit ?? 100)),
+  );
+  const id = await start();
+  await harness.behavior.emitThreadEvent("thread.failed", {
+    thread: makeThreadResponse({ id: CHILD, projectId: "proj_1", status: "error" }),
+    error: "Provider error",
+  });
+  const run = await settled(id, 1_000);
+  assert.equal(run.error, "Rate limit reached");
+});

@@ -495,8 +495,14 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<ChildFailure> {
     const fallback = reported ?? "The enhancement thread failed";
     try {
-      const events = await bb.sdk.threads.events.list({ threadId: childThreadId });
-      const lastError = [...events].reverse().find((event) => event.type.includes("error"));
+      // Newest first: bb's default page is the OLDEST 100 events, and a
+      // child that streamed a long rewrite before failing has more than that.
+      const events = await bb.sdk.threads.events.list({
+        threadId: childThreadId,
+        order: "desc",
+        limit: "50",
+      });
+      const lastError = events.find((event) => event.type.includes("error"));
       if (lastError === undefined) return { message: fallback, detail: null };
       const data = lastError.data as { message?: unknown; text?: unknown; detail?: unknown };
       const message = [data.message, data.text].find(
