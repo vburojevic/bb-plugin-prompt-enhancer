@@ -21,11 +21,10 @@
 // The user can pin an explicit provider+model for the enhancement thread on
 // the plugin's settings page; without an override the scope thread's provider
 // is inherited and the model stays at that provider's default.
-import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { buildEnhancePrompt } from "./lib/enhance-prompt";
 import { adaptiveTimeoutMs } from "./lib/adaptive-timeout";
-import { startSerialPoll } from "./lib/serial-poll";
 
 const REALTIME_CHANNEL = "prompt-enhancer";
 const OVERRIDE_KEY = "model-override";
@@ -87,17 +86,13 @@ const resumeRunSchema = z.object({
   error: z.string().nullable(),
 });
 
-/** bb's reasoning levels, as accepted by threads.spawn. */
-const reasoningLevelSchema = z.enum([
-  "none",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "ultracode",
-  "max",
-  "ultra",
-]);
+/**
+ * A reasoning level id as the provider lists it ("low", "xhigh", "minimal",
+ * …). Providers define their own ids and threads.spawn takes any of them, so
+ * this is not a fixed list: one unfamiliar id used to fail the whole model
+ * catalog, which left the settings picker empty.
+ */
+const reasoningLevelSchema = z.string().min(1).max(64);
 
 const modelOverrideSchema = z.object({
   providerId: z.string().min(1),
@@ -107,11 +102,15 @@ const modelOverrideSchema = z.object({
 });
 type ModelOverride = z.infer<typeof modelOverrideSchema>;
 
-/** How often the child thread's partial output is polled while pending. */
-const PROGRESS_POLL_MS = 400;
-/** Progress polling stops unconditionally after this long (outlives the
- * largest adaptive timeout so a slow run keeps painting to the end). */
+/** A child still pending after this long is stopped (outlives the largest
+ * adaptive timeout so a slow run keeps painting to the end). */
 const PROGRESS_MAX_MS = 190_000;
+/**
+ * How long a child's event stream must stay quiet, with output written,
+ * before that output counts as the rewrite. thread.idle normally lands well
+ * before this; it is the fallback for a provider slow to tear down.
+ */
+const PROGRESS_QUIET_MS = 1_500;
 
 /** Tail of the scope thread's last output shown to the rewriter as context. */
 const CONTEXT_OUTPUT_CAP = 1500;
@@ -316,7 +315,7 @@ export default async function plugin(bb: BbPluginApi) {
   db.prepare(`DELETE FROM enhancements WHERE created_at < ?`).run(
     Date.now() - 7 * 24 * 60 * 60 * 1000,
   );
-  // Rows still pending at load lost their progress poller to a restart or a
+  // Rows still pending at load lost their progress watch to a restart or a
   // plugin reload. Their child threads usually kept working, so these are
   // re-attached below rather than failed.
   const orphans = db
@@ -481,6 +480,20 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  /** The message of the child's latest error event, or null. Never throws. */
+  async function lastErrorMessage(childThreadId: string): Promise<string | null> {
+    try {
+      const events = await bb.sdk.threads.events.list({ threadId: childThreadId });
+      const lastError = [...events].reverse().find((event) => event.type.includes("error"));
+      if (lastError === undefined) return null;
+      const data = lastError.data as { message?: unknown; text?: unknown };
+      const message = typeof data.message === "string" ? data.message : data.text;
+      return typeof message === "string" && message.length > 0 ? message : null;
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * A child thread failed. If it never wrote anything and attempts remain,
    * start a fresh one; otherwise the run fails with the child's error.
@@ -488,9 +501,9 @@ export default async function plugin(bb: BbPluginApi) {
   function childFailed(id: string, childThreadId: string, message: string): void {
     cleanupChildThread(childThreadId);
     const row = byId.get(id) as EnhancementRow | undefined;
-    // The poller and thread.failed can both report the same child; only the
-    // first report for the run's current child acts. A late report about a
-    // replaced child must not stop the poller of the child that replaced it.
+    // Only the first report for the run's current child acts. A late report
+    // about a replaced child must not stop the watch of the child that
+    // replaced it.
     if (row === undefined || row.status !== "pending" || row.child_thread_id !== childThreadId) {
       return;
     }
@@ -524,140 +537,155 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   // ---------------------------------------------------------------------
-  // Live progress: no delta events exist in the plugin SDK, so while an
-  // enhancement is pending we poll the child thread's partial output and
-  // relay growth to the composer. Chunky (~0.6s) but genuine tokens.
+  // Live progress: bb announces each advance of a thread's event sequence
+  // (experimental_thread.events, at most once a second per thread). Each
+  // announcement for a pending child reads its assembled output and relays
+  // growth to the composer. Completion and failure arrive as thread.idle and
+  // thread.failed below; nothing polls the child.
   // ---------------------------------------------------------------------
-  const progressTimers = new Map<string, () => void>();
+  type ProgressWatch = {
+    childThreadId: string;
+    /** Longest output relayed so far; only growth is published. */
+    lastSeen: string;
+    /** A read is running; `again` asks for one more once it ends. */
+    reading: boolean;
+    again: boolean;
+    quietTimer: ReturnType<typeof setTimeout> | null;
+    capTimer: ReturnType<typeof setTimeout>;
+  };
+  const watches = new Map<string, ProgressWatch>();
   let disposed = false;
   bb.onDispose(() => {
     disposed = true;
-    for (const stop of progressTimers.values()) stop();
-    progressTimers.clear();
+    for (const id of [...watches.keys()]) stopProgress(id);
   });
 
   function stopProgress(id: string): void {
-    const timer = progressTimers.get(id);
-    if (timer !== undefined) {
-      timer();
-      progressTimers.delete(id);
-    }
+    const watch = watches.get(id);
+    if (watch === undefined) return;
+    if (watch.quietTimer !== null) clearTimeout(watch.quietTimer);
+    clearTimeout(watch.capTimer);
+    watches.delete(id);
   }
 
-  /** Polls of unchanged non-empty output before it counts as the result. */
-  const PROGRESS_STABLE_POLLS = 3;
+  /** The run's result is in: record it and retire the child. */
+  function finalize(id: string, childThreadId: string, text: string): void {
+    stopProgress(id);
+    const row = byId.get(id) as EnhancementRow | undefined;
+    if (row === undefined || row.status !== "pending" || row.child_thread_id !== childThreadId) {
+      return;
+    }
+    const enhanced = text.trim();
+    if (enhanced.length === 0) {
+      fail(id, "The enhancement thread returned an empty response");
+    } else {
+      markDone.run(enhanced, Date.now() - row.created_at, id);
+      publish(id, "done");
+      forgetSpawnPlan(id);
+    }
+    cleanupChildThread(childThreadId);
+  }
 
   function startProgress(id: string, childThreadId: string): void {
     if (disposed) return;
     stopProgress(id);
-    const startedAt = Date.now();
-    let lastSeen = "";
-    let stablePolls = 0;
-
-    function finalize(row: EnhancementRow, text: string): void {
-      stopProgress(id);
-      const enhanced = text.trim();
-      if (enhanced.length === 0) {
-        fail(id, "The enhancement thread returned an empty response");
-      } else {
-        markDone.run(enhanced, Date.now() - row.created_at, id);
-        publish(id, "done");
-        forgetSpawnPlan(id);
-      }
-      cleanupChildThread(childThreadId);
-    }
-
-    const timer = startSerialPoll(async (isStopped) => {
-      try {
-        const row = byId.get(id) as EnhancementRow | undefined;
-        if (row === undefined || row.status !== "pending") {
-          stopProgress(id);
-          return;
-        }
-        if (Date.now() - startedAt > PROGRESS_MAX_MS) {
-          // Give the row a terminal state instead of abandoning it as
-          // pending forever: a client resuming this scope must learn that
-          // the run is dead rather than wait on it indefinitely.
-          stopProgress(id);
+    const watch: ProgressWatch = {
+      childThreadId,
+      lastSeen: "",
+      reading: false,
+      again: false,
+      quietTimer: null,
+      capTimer: setTimeout(() => {
+        if (watches.get(id) !== watch) return;
+        // Give the row a terminal state instead of abandoning it as pending
+        // forever: a client resuming this scope must learn that the run is
+        // dead rather than wait on it indefinitely.
+        stopProgress(id);
+        try {
+          const row = byId.get(id) as EnhancementRow | undefined;
+          if (row?.status !== "pending" || row.child_thread_id !== childThreadId) return;
           fail(id, "The enhancement took too long and was stopped");
           cleanupChildThread(childThreadId);
-          return;
+        } catch {
+          // Stale handle mid-reload — nothing safe left to do.
         }
+      }, PROGRESS_MAX_MS),
+    };
+    watches.set(id, watch);
+    // Output written before this watch existed (a reattached orphan, or
+    // events that beat the spawn reply) has no announcement left to come.
+    void readProgress(id, watch);
+  }
+
+  /**
+   * Reads a pending child's output once and relays growth. Reads for one run
+   * never overlap: an announcement during a read schedules one more read.
+   */
+  async function readProgress(id: string, watch: ProgressWatch): Promise<void> {
+    if (watch.reading) {
+      watch.again = true;
+      return;
+    }
+    watch.reading = true;
+    try {
+      do {
+        watch.again = false;
         const { output } = await bb.sdk.threads.output({
-          threadId: childThreadId,
+          threadId: watch.childThreadId,
         });
-        if (isStopped()) return;
+        if (watches.get(id) !== watch) return;
         const text = output ?? "";
         if (text.length > 0) producedOutput.add(id);
-        if (text.length > lastSeen.length) {
+        if (text.length > watch.lastSeen.length) {
           // Monotonic: only growth is relayed, so the composer never sees
           // the text shrink or flicker between event-assembly states.
-          bb.realtime.publish(REALTIME_CHANNEL, {
-            id,
-            status: "progress",
-            text,
-          });
+          watch.lastSeen = text;
+          bb.realtime.publish(REALTIME_CHANNEL, { id, status: "progress", text });
         }
-        stablePolls = text.length > 0 && text === lastSeen ? stablePolls + 1 : 0;
-        lastSeen = text;
         // Optimistic finish: output is assembled from COMPLETED messages
-        // only, so non-empty text that stays unchanged across several
-        // polls IS the rewrite — the thread just spends multiple further
-        // seconds in provider teardown before thread.idle fires, which
-        // previously left the composer locked and the pill spinning long
-        // after the full text had painted. The idle check below and the
-        // lifecycle events remain as fallbacks (all status-guarded).
-        if (stablePolls >= PROGRESS_STABLE_POLLS) {
-          finalize(row, text);
-          return;
-        }
-        const child = await bb.sdk.threads.get({ threadId: childThreadId });
-        if (isStopped()) return;
-        if (child.status === "idle") {
-          finalize(row, text);
-        } else if (child.status === "error") {
-          // The child's own error (rate limit, out of credits, provider
-          // failure) is what the user needs to see — a generic "failed"
-          // sends them digging through a thread that is about to be
-          // deleted. thread.failed carries the same text as a fallback.
-          let message = "The enhancement thread failed";
-          try {
-            const events = await bb.sdk.threads.events.list({
-              threadId: childThreadId,
-            });
-            if (disposed) return;
-            const lastError = [...events]
-              .reverse()
-              .find((event) => event.type.includes("error"));
-            const detail =
-              lastError === undefined
-                ? null
-                : ((lastError.data as { message?: string; text?: string })
-                    .message ??
-                  (lastError.data as { text?: string }).text ??
-                  null);
-            if (detail) message = detail;
-          } catch {
-            // Keep the generic message.
-          }
-          childFailed(id, childThreadId, message);
-        }
-      } catch {
-        // Stale handle or the child is gone — either way stop polling;
-        // the lifecycle events still resolve the enhancement. A poller that
-        // was already replaced by a retry must leave the new one running.
-        if (!isStopped()) stopProgress(id);
-      }
-    }, PROGRESS_POLL_MS);
-    progressTimers.set(id, timer);
+        // only, so written output followed by a quiet event stream IS the
+        // rewrite, even when the provider takes a while to tear down before
+        // thread.idle. Every announcement restarts the wait.
+        if (watch.quietTimer !== null) clearTimeout(watch.quietTimer);
+        watch.quietTimer =
+          watch.lastSeen.trim().length > 0
+            ? setTimeout(() => {
+                if (watches.get(id) !== watch || watch.reading) return;
+                try {
+                  finalize(id, watch.childThreadId, watch.lastSeen);
+                } catch {
+                  // Stale handle mid-reload — nothing safe left to do.
+                }
+              }, PROGRESS_QUIET_MS)
+            : null;
+      } while (watch.again && watches.get(id) === watch);
+    } catch {
+      // Stale handle or the child is gone. thread.idle / thread.failed still
+      // resolve the run, and the cap timer bounds it.
+    } finally {
+      watch.reading = false;
+    }
   }
+
+  bb.events.on("experimental_thread.events", ({ thread }) => {
+    try {
+      const row = pendingByChild.get(thread.id) as EnhancementRow | undefined;
+      if (row === undefined) return;
+      const watch = watches.get(row.id);
+      if (watch !== undefined && watch.childThreadId === thread.id) {
+        void readProgress(row.id, watch);
+      }
+    } catch {
+      // Stale handle mid-reload — nothing safe left to do.
+    }
+  });
 
   /**
    * Rows left pending by a restart or a plugin reload. The hidden child thread
    * is a real bb thread and does NOT stop when this plugin does, so failing
    * these outright threw away rewrites that were still being written — the
    * same loss the user sees on a thread switch, one layer down. Re-attach a
-   * poller to every child that is still there; only fail the ones whose child
+   * watch to every child that is still there; only fail the ones whose child
    * is genuinely gone (or was never spawned, because the crash beat spawn).
    *
    * Detached and fully guarded: this runs during plugin load, where an
@@ -678,8 +706,15 @@ export default async function plugin(bb: BbPluginApi) {
           cleanupChildThread(orphan.child_thread_id);
           continue;
         }
-        // Idle children resolve on the poller's very first tick, so the same
-        // path covers "finished while we were down" and "still writing".
+        if (child.status === "idle") {
+          // Finished while we were down: its thread.idle is not replayed.
+          const { output } = await bb.sdk.threads.output({
+            threadId: orphan.child_thread_id,
+          });
+          finalize(orphan.id, orphan.child_thread_id, output ?? "");
+          continue;
+        }
+        // Still writing: watch it like a fresh child.
         startProgress(orphan.id, orphan.child_thread_id);
       } catch {
         // The child thread is unreachable or deleted; nothing will ever
@@ -1028,21 +1063,22 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
     const row = pendingByChild.get(thread.id) as EnhancementRow | undefined;
     if (!row) return;
-    stopProgress(row.id);
-    const enhanced = (lastAssistantText ?? "").trim();
-    if (enhanced.length === 0) {
-      fail(row.id, "The enhancement thread returned an empty response");
-    } else {
-      markDone.run(enhanced, Date.now() - row.created_at, row.id);
-      publish(row.id, "done");
-      forgetSpawnPlan(row.id);
-    }
-    cleanupChildThread(thread.id);
+    finalize(row.id, thread.id, lastAssistantText ?? "");
   });
 
-  bb.events.on("thread.failed", ({ thread, error }) => {
-    const row = pendingByChild.get(thread.id) as EnhancementRow | undefined;
-    if (!row) return;
-    childFailed(row.id, thread.id, error ?? "The enhancement thread failed");
+  bb.events.on("thread.failed", async ({ thread, error }) => {
+    try {
+      const row = pendingByChild.get(thread.id) as EnhancementRow | undefined;
+      if (!row) return;
+      stopProgress(row.id);
+      // The child's own error (rate limit, out of credits, provider failure)
+      // is what the user needs to see — a generic "failed" sends them digging
+      // through a thread that is about to be deleted.
+      const message = error ?? (await lastErrorMessage(thread.id));
+      if (disposed) return;
+      childFailed(row.id, thread.id, message ?? "The enhancement thread failed");
+    } catch {
+      // Stale handle mid-reload — nothing safe left to do.
+    }
   });
 }

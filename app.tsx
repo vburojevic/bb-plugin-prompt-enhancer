@@ -17,10 +17,9 @@ import {
   definePluginApp,
   type ComposerDraft,
   useComposer,
-  useComposerView,
   useRealtime,
   useRpc,
-} from "@bb/plugin-sdk/app";
+} from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { rpcContract } from "./server";
 import { Icon } from "@/components/ui/icon";
@@ -73,15 +72,8 @@ interface EnhanceSignal {
   /** Present on "progress": the child thread's partial output so far. */
   text?: string;
 }
-type ReasoningLevel =
-  | "none"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh"
-  | "ultracode"
-  | "max"
-  | "ultra";
+/** A provider's reasoning level id ("low", "xhigh", "minimal", …). */
+type ReasoningLevel = string;
 interface ModelOverride {
   providerId: string;
   model: string;
@@ -106,7 +98,7 @@ function levelLabel(level: ReasoningLevel): string {
   if (level === "xhigh") return "XHigh";
   return level.charAt(0).toUpperCase() + level.slice(1);
 }
-type ComposerScope = ReturnType<typeof useComposerView>["scope"];
+type ComposerScope = ReturnType<typeof useComposer>["scope"];
 
 /** One key per composer draft — see `lib/scope-key`. */
 function scopeKey(scope: ComposerScope): string {
@@ -137,12 +129,6 @@ interface PendingRun {
   mentionLabels: readonly string[];
 }
 const pendingRuns = new Map<string, PendingRun>();
-
-/**
- * Latest structured @-mention labels per scope, from the composer's
- * richText observer — ground truth for the dropped-reference guard.
- */
-const mentionLabelsByScope = new Map<string, readonly string[]>();
 
 // ---------------------------------------------------------------------------
 // Animation styles — raw CSS because keyframes cannot come from the Tailwind
@@ -268,7 +254,6 @@ function prefersReducedMotion(): boolean {
 
 function EnhanceButton() {
   const composer = useComposer();
-  const view = useComposerView();
   const rpc = useRpc<typeof rpcContract>();
   const [busy, setBusy] = useState(false);
   const [cancelHover, setCancelHover] = useState(false);
@@ -303,13 +288,13 @@ function EnhanceButton() {
   const revealTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const myScopeKey = scopeKey(view.scope);
+  const myScopeKey = scopeKey(composer.scope);
 
   // While busy the button stays enabled — it becomes the cancel button.
   // A running agent does NOT disable enhancing: drafting while the agent
   // works is exactly when a queued prompt gets refined.
-  const startDisabled = busy || view.draft.isEmpty;
-  const disabled = !busy && view.draft.isEmpty;
+  const startDisabled = busy || composer.isEmpty;
+  const disabled = !busy && composer.isEmpty;
 
   function stopTimers(): void {
     if (timeoutRef.current !== null) {
@@ -717,13 +702,11 @@ function EnhanceButton() {
     // Every composer flavor that knows its thread hands it over so the
     // enhancement inherits that thread's provider; only the new-thread
     // composer falls back to the project default.
-    const scope = view.scope;
+    const scope = composer.scope;
     const scopeThreadId =
       scope.kind === "thread" || scope.kind === "queued-message"
         ? scope.threadId
-        : scope.kind === "side-chat"
-          ? (scope.childThreadId ?? scope.parentThreadId)
-          : null;
+        : null;
     const scopeProjectId = scope.kind === "new-thread" ? scope.projectId : null;
     // Read the preview toggle fresh per run so a settings change applies to
     // the very next enhancement, not the next window load.
@@ -731,8 +714,10 @@ function EnhanceButton() {
       .call("getPrefs")
       .then((prefs) => prefs.previewBeforeApply)
       .catch(() => false);
-    const mentionLabels = mentionLabelsByScope.get(myScopeKey) ?? [];
     const { text: originalText, mentions: originalMentions } = composer.draft;
+    // The draft's structured @-mentions: ground truth for the dropped-reference
+    // guard, alongside the pills re-anchored on the rewrite.
+    const mentionLabels = originalMentions.map((mention) => mention.label);
     let id: string;
     let timeoutMs = FALLBACK_TIMEOUT_MS;
     try {
@@ -743,7 +728,7 @@ function EnhanceButton() {
         scopeKey: myScopeKey,
         threadId: scopeThreadId,
         projectId: scopeProjectId,
-        attachmentCount: view.draft.attachmentCount,
+        attachmentCount: composer.attachmentCount,
         previewGate: previewGateRef.current,
         mentionLabels: [...mentionLabels],
       }));
@@ -1184,16 +1169,6 @@ export default definePluginApp((app) => {
   app.composer.customize({
     id: "prompt-enhancer",
     actions: [{ id: "enhance", component: EnhanceButton }],
-    richText: {
-      // Ground truth for the dropped-reference guard: the composer's
-      // structured @-mentions, tracked per scope as the draft changes.
-      onDraftChange(draft, view) {
-        mentionLabelsByScope.set(
-          scopeKey(view.scope),
-          draft.mentions.map((mention) => mention.label),
-        );
-      },
-    },
   });
   // Keyframes for the busy shimmer and the settle sweep. The Tailwind pass
   // cannot emit raw keyframes, so a content script injects them and cleans
