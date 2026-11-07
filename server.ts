@@ -102,8 +102,9 @@ const modelOverrideSchema = z.object({
 });
 type ModelOverride = z.infer<typeof modelOverrideSchema>;
 
-/** A child still pending after this long is stopped (outlives the largest
- * adaptive timeout so a slow run keeps painting to the end). */
+/** A run still pending this long after it started is stopped, however many
+ * children it went through (outlives the largest adaptive timeout so a slow
+ * run keeps painting to the end). The composer stays locked until then. */
 const PROGRESS_MAX_MS = 190_000;
 /**
  * How long a child's event stream must stay quiet, with output written,
@@ -625,6 +626,9 @@ export default async function plugin(bb: BbPluginApi) {
   function startProgress(id: string, childThreadId: string): void {
     if (disposed) return;
     stopProgress(id);
+    // Counted from the run's start, not this child's: a retried child or a
+    // child reattached after a reload must not restart the clock.
+    const startedAt = (byId.get(id) as EnhancementRow | undefined)?.created_at ?? Date.now();
     const watch: ProgressWatch = {
       childThreadId,
       lastSeen: "",
@@ -645,7 +649,7 @@ export default async function plugin(bb: BbPluginApi) {
         } catch {
           // Stale handle mid-reload — nothing safe left to do.
         }
-      }, PROGRESS_MAX_MS),
+      }, Math.max(0, startedAt + PROGRESS_MAX_MS - Date.now())),
     };
     watches.set(id, watch);
     // Output written before this watch existed (a reattached orphan, or

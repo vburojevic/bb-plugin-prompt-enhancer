@@ -263,3 +263,23 @@ test("a child that streamed a long rewrite before failing still shows the cause"
   const run = await settled(id, 1_000);
   assert.equal(run.error, "Rate limit reached");
 });
+
+test("the time cap counts from the run's start, not from a retried child's", { timeout: 10_000 }, async (t) => {
+  // Freeze the clock at a real instant; only Date moves, timers stay real.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const { harness, child, start, settled } = await setup();
+  harness.inspection.sdk.stub("threads.events.list", async () => [startFailure]);
+  const startedAt = Date.now();
+  const id = await start();
+  // The first child takes almost the whole budget to fail to start.
+  t.mock.timers.setTime(startedAt + 189_500);
+  await harness.behavior.emitThreadEvent("thread.failed", {
+    thread: makeThreadResponse({ id: CHILD, projectId: "proj_1", status: "error" }),
+    error: "Command thread.start failed",
+  });
+  await waitFor(() => child.spawned === 2, "the retry");
+  // The retry gets the half second the run has left, not another 190 s.
+  const run = await settled(id, 2_000);
+  assert.equal(run.status, "error");
+  assert.equal(run.error, "The enhancement took too long and was stopped");
+});
